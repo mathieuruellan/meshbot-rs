@@ -4,3 +4,9 @@
 # tracked. Never commit these — the .env carries webhook IDs and auth tokens.
 /config.yaml
 /.env
+
+# Installed action scripts live on the host and are edited there. The tracked
+# copies in scripts.example/ are templates: copy them across, do not symlink or
+# bind-mount them, or a local edit becomes a repo change and a token pasted for
+# testing becomes a commit.
+/scripts/

@@ -1,0 +1,45 @@
+//! Grammar for one channel message: `verb [word | key=value]...`.
+//!
+//! The verb is the only positional argument. A bare word is an enum value the
+//! verb's config entry declares; a slot is a typed `key=value` pair. Nothing
+//! in this grammar can name a host, an entity or a URL — that mapping lives in
+//! the action script, so a message can never be steered at a target.
+//!
+//! Deliberately absent: IPv4. It was in the original list of value types, but
+//! once the host mapping moved into the scripts, a message-supplied address
+//! would only ever reintroduce the target-selection hole that the enum removes.
+
+// A plain space, and only a plain space, separates tokens. Tabs and newlines
+// are rejected by the byte-level pre-check before the grammar ever runs.
+space = _{ " " }
+
+// The separator precedes each arg, and a trailing run of spaces is tolerated
+// so `garage open ` still parses.
+command = { SOI ~ verb ~ (space+ ~ arg)* ~ space* ~ EOI }
+
+verb = @{ (ASCII_ALPHANUMERIC | "-")+ }
+
+arg   =  { slot | word }
+slot  =  { key ~ "=" ~ value }
+key   = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+value =  { float | int | bool | quoted | word }
+
+// The `!word_char` guard is what makes `code=5abc` a word rather than a
+// truncated integer followed by garbage, and `code=truely` a word rather than
+// `true` plus a syntax error: a keyword or a number only counts if no word
+// character follows it.
+int   = @{ "-"? ~ ASCII_DIGIT+ ~ !word_char }
+float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ !word_char }
+bool  = @{ ("true" | "false") ~ !word_char }
+
+// Compound-atomic so the pair arrives as one span; the quotes are stripped when
+// the value is decoded.
+quoted      = ${ "\"" ~ quoted_body ~ "\"" }
+quoted_body = @{ (!"\"" ~ ANY)* }
+
+// `/` would allow a path and `=` would let a second slot hide inside a word.
+// Quotes belong to `quoted`. Everything here is one mesh airtime frame, so the
+// value space is deliberately small. `ANY` failing at end of input is what
+// terminates a trailing word, so no explicit end-of-input guard is needed.
+word_char = @{ !(space | "/" | "=" | "\"" | "'") ~ ANY }
+word      = @{ word_char+ }

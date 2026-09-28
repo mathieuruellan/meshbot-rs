@@ -10,9 +10,10 @@ futures = "0.3.34"
 meshcore-rs = { version = "=0.2.0", default-features = false, features = ["tcp"] }
 pest = "2.9.2"
 pest_derive = "2.9.2"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+# Actions are scripts, not HTTP. The config loader that will read verb entries
+# from YAML needs this; nothing reads YAML yet.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "time", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

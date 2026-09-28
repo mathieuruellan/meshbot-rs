@@ -4,63 +4,168 @@
 # is mounted read-only. Nothing here is read by the container at build time.
 #
 # This schema is NOT implemented yet; the loader comes with the rule engine.
+# The vocabulary in `verbs:` is the shape the hardcoded table in src/verbs.rs
+# produces today, so this file documents the target rather than a second
+# source of truth that already exists.
 
 # Bumped on breaking changes. The binary refuses to start on a mismatch, so a
 # host config edited ahead of a deploy fails loudly instead of half-working.
 schema: 1
 
+# The message language is `verb [word] [key=value ...]`:
+#
+#   garage              -> status query
+#   garage open         -> act, using the declared word `open`
+#   reboot alpha       -> act, then arm a 30s latch
+#   reboot alpha ok    -> the confirmation for exactly that command
+#
+# The verb is the only positional argument, and a bare word must be one a verb
+# declares. That is what makes it impossible for a message to name a host: the
+# word is a lookup key, never a target. Slots are `key=value`; `/`, quotes and
+# a second `=` are rejected inside a word, so no path or hidden slot can be
+# smuggled in. Input over 64 bytes, or containing a newline, tab or carriage
+# return, is refused before parsing.
+#
+# Templates: `{{slot}}` for a declared value, `{{stdout}}` for clamped script
+# output, `${ENV}` for the environment. An unresolved placeholder fails at load,
+# not at message time.
+#
+# Reserved: a message cannot set `verb`, `channel`, `channel_idx`, `snr`,
+# `sender_timestamp`, `status`, `stdout`, `target` or any `${ENV}` name. A
+# collision poisons that key, so a rule reading it simply does not match.
+
 bot:
   # Physical radio channel index -> expected channel name.
   #
-  # This map is both the listen set and a startup assertion: the bot reads
-  # slots 0..7 back with GET_CHANNEL and refuses to start on any mismatch, so
-  # a radio re-layout can't silently point rules at the wrong channel.
+  # This map is both the listen set and a startup assertion: the bot reads the
+  # slots back with GET_CHANNEL and refuses to start on any mismatch, so a radio
+  # re-layout can't silently point verbs at the wrong channel.
   #
   # Never add a SET_CHANNEL call. That is the one command that engages the
   # proxy's channel virtualizer, which would remap these indices.
   channels:
-    3: "ruellan-family #biniou-admin"
-    4: "ruellan-family #biniou-ha"
+    3: "#admin"
+    4: "#homeassistant"
 
   defaults:
     action_timeout_secs: 10
-    max_reply_chars: 200
+    # Bytes, not characters. MeshCore caps a channel payload at 160 bytes and
+    # `send_channel_msg` appends without checking, so an over-long reply hangs
+    # on the radio rather than truncating.
+    max_reply_bytes: 150
+    # How long a gated command stays armed. Single use, keyed on the canonical
+    # command, so `reboot alpha` and `REBOOT  alpha` share one armed state.
+    confirm_ttl_secs: 30
     dedupe_window_secs: 300
 
-# Reusable HTTP targets. A rule references one by name.
-# url comes from the environment, never from a mesh message, so a relayed
-# message cannot steer the bot at an arbitrary host.
-actions:
-  notify:
-    method: POST
-    url: ${HA_URL}
-    path: /api/webhook/meshbot
-    headers:
-      Authorization: Bearer ${HA_TOKEN}
-      Content-Type: application/json
-    body:
-      message: "{{text}}"
-      channel: "{{channel}}"
+  # Actions name a script inside this directory. A path that resolves outside it
+  # is rejected at load, and it is executed directly — never through a shell, so
+  # a template value can never be command injection.
+  script_dir: /data/meshcore/meshbot-rs/scripts
 
-  delete-entity:
-    method: DELETE
-    url: ${HA_URL}
-    path: /api/states/{{entity}}
-    confirm: true          # required for DELETE
+# `help` and `help <verb>` are built in and are not configurable: the reply is
+# rendered from this table, so a verb cannot be added without documenting it.
+verbs:
+  - name: alarm
+    desc: "alarm state"
+    channel: "#homeassistant"
+    get:
+      script: ha-entity.sh
+      # Literal config value. The entity id is never taken from a message.
+      args: ["alarm_control_panel.alarm"]
+      env: [HA_URL, HA_TOKEN]
+      reply: "{{stdout}}"
+    args:
+      - words: [arm, on, lock]
+        script: ha-service.sh
+        args: ["{{target}}"]
+        env: [HA_URL, HA_TOKEN]
+        mutating: true
+        # Idempotent on a private channel, so no latch. An alarm that is
+        # already armed is not a mistake worth a second message.
+        confirm: false
+        reply: "armed"
+      - words: [disarm, off]
+        script: ha-service.sh
+        args: ["{{target}}"]
+        env: [HA_URL, HA_TOKEN]
+        mutating: true
+        confirm: false
+        reply: "disarmed"
 
-# Evaluated top to bottom; every match fires.
-rules:
-  - name: lights-on
-    when:
-      channel: "ruellan-family #biniou-ha"
-      verb: light
-      state: on
-    actions:
-      - use: notify
-    reply: "lights on"
+  - name: garage
+    desc: "garage state"
+    channel: "#homeassistant"
+    get:
+      script: ha-entity.sh
+      args: ["cover.garage"]
+      env: [HA_URL, HA_TOKEN]
+      reply: "{{stdout}}"
+    args:
+      - words: [open, up]
+        script: ha-service.sh
+        args: ["{{target}}"]
+        env: [HA_URL, HA_TOKEN]
+        mutating: true
+        confirm: false
+        reply: "opening"
+      - words: [close, down]
+        script: ha-service.sh
+        args: ["{{target}}"]
+        env: [HA_URL, HA_TOKEN]
+        mutating: true
+        confirm: false
+        reply: "closing"
+      - words: [stop]
+        script: ha-service.sh
+        args: ["{{target}}"]
+        env: [HA_URL, HA_TOKEN]
+        mutating: true
+        confirm: false
+        reply: "stopped"
 
-  - name: unknown-verb
-    when:
-      verb: ping
-    actions: []
-    reply: "pong"
+  - name: internet
+    desc: "link and internet reachability"
+    channel: "#admin"
+    get:
+      # Runs from this container, so the host needs ping permitted — CAP_NET_RAW
+      # or a widened net.ipv4.ping_group_range. /dev/tcp is the fallback when
+      # raw sockets are not.
+      script: internet-status.sh
+      args: ["8.8.8.8", "1.1.1.1"]
+      reply: "{{stdout}}"
+
+  - name: komodo
+    desc: "maintenance state"
+    channel: "#admin"
+    get:
+      script: komodo-status.sh
+      env: [KOMODO_URL, KOMODO_TOKEN]
+      reply: "{{stdout}}"
+
+  - name: reboot
+    desc: "restart a machine"
+    channel: "#admin"
+    # No `get`: there is nothing to report, so a bare `reboot` answers with the
+    # word list instead of running anything.
+    args:
+      - words: [alpha, beta, gamma, delta, komodo, pve]
+        script: pve-reboot.sh
+        # The script owns the word -> vmid/kind mapping. meshbot-rs never learns
+        # what a machine is, so the mapping can change without touching config.
+        args: ["{{target}}"]
+        # An explicit allowlist: the subprocess must not inherit the bot's
+        # environment, or the channel secret and every other token land in
+        # every script.
+        #
+        # PVE_ALLOW_REBOOT is named here even though it is not a credential. The
+        # child's environment is emptied, so a variable this list omits is
+        # invisible to the script — which would pin the dry-run guard on and
+        # leave `reboot` permanently inert. Unset is a hard error naming the
+        # variable; `0` is a dry run; `1` reboots.
+        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+        mutating: true
+        # A reboot is disruptive and not idempotent, and the reply travels after
+        # the machine is already going down. Worth the extra message.
+        confirm: true
+        reply: "{{stdout}}"
