@@ -1,0 +1,66 @@
+# meshbot-rs configuration — TEMPLATE ONLY.
+#
+# The real file lives on the host at /data/meshcore/meshbot-rs/config.yaml and
+# is mounted read-only. Nothing here is read by the container at build time.
+#
+# This schema is NOT implemented yet; the loader comes with the rule engine.
+
+# Bumped on breaking changes. The binary refuses to start on a mismatch, so a
+# host config edited ahead of a deploy fails loudly instead of half-working.
+schema: 1
+
+bot:
+  # Physical radio channel index -> expected channel name.
+  #
+  # This map is both the listen set and a startup assertion: the bot reads
+  # slots 0..7 back with GET_CHANNEL and refuses to start on any mismatch, so
+  # a radio re-layout can't silently point rules at the wrong channel.
+  #
+  # Never add a SET_CHANNEL call. That is the one command that engages the
+  # proxy's channel virtualizer, which would remap these indices.
+  channels:
+    3: "ruellan-family #biniou-admin"
+    4: "ruellan-family #biniou-ha"
+
+  defaults:
+    action_timeout_secs: 10
+    max_reply_chars: 200
+    dedupe_window_secs: 300
+
+# Reusable HTTP targets. A rule references one by name.
+# url comes from the environment, never from a mesh message, so a relayed
+# message cannot steer the bot at an arbitrary host.
+actions:
+  notify:
+    method: POST
+    url: ${HA_URL}
+    path: /api/webhook/meshbot
+    headers:
+      Authorization: Bearer ${HA_TOKEN}
+      Content-Type: application/json
+    body:
+      message: "{{text}}"
+      channel: "{{channel}}"
+
+  delete-entity:
+    method: DELETE
+    url: ${HA_URL}
+    path: /api/states/{{entity}}
+    confirm: true          # required for DELETE
+
+# Evaluated top to bottom; every match fires.
+rules:
+  - name: lights-on
+    when:
+      channel: "ruellan-family #biniou-ha"
+      verb: light
+      state: on
+    actions:
+      - use: notify
+    reply: "lights on"
+
+  - name: unknown-verb
+    when:
+      verb: ping
+    actions: []
+    reply: "pong"

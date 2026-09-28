@@ -1,0 +1,6 @@
+/target
+
+# Real config is host-owned and mounted read-only; only the .example files are
+# tracked. Never commit these — the .env carries webhook IDs and auth tokens.
+/config.yaml
+/.env
