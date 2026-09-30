@@ -91,6 +91,31 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Extra keys a message may not set, on top of the engine's own.
+///
+/// The `.env` names go here because a declared action interpolates them into
+/// templates and hands them to a script. A message that could set `HA_TOKEN` as
+/// a slot would have that value written into a reply, and a `{{HA_TOKEN}}`
+/// template would pick it up in place of the real one.
+#[derive(Debug, Clone, Default)]
+pub struct Reserved(BTreeSet<String>);
+
+impl Reserved {
+    pub fn new<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self(
+            names
+                .into_iter()
+                .map(|n| n.as_ref().trim().to_ascii_lowercase())
+                .filter(|n| !n.is_empty())
+                .collect(),
+        )
+    }
+}
+
 /// The parsed form of one message.
 #[derive(Debug, Clone, Default)]
 pub struct Context {
@@ -103,20 +128,16 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new() -> Self {
+    pub fn new_with(extra: &Reserved) -> Self {
         Self {
             values: BTreeMap::new(),
-            reserved: RESERVED_KEYS.iter().map(|k| (*k).to_string()).collect(),
+            reserved: RESERVED_KEYS
+                .iter()
+                .map(|k| (*k).to_string())
+                .chain(extra.0.iter().cloned())
+                .collect(),
             poisoned: BTreeSet::new(),
         }
-    }
-
-    /// Add a key to the reserved set — used for the `.env` names, which are
-    /// interpolated into templates and so must not be settable by a message.
-    // Dead until the config loader exists to call it with those names.
-    #[allow(dead_code)]
-    pub fn reserve(&mut self, key: &str) {
-        self.reserved.insert(key.to_ascii_lowercase());
     }
 
     pub fn verb(&self) -> Option<&str> {
@@ -211,7 +232,13 @@ impl Context {
     }
 }
 
+/// Parse with no extra reserved keys. Test shorthand for [`parse_with`].
+#[cfg(test)]
 pub fn parse(input: &str) -> Result<Context, ParseError> {
+    parse_with(input, &Reserved::default())
+}
+
+pub fn parse_with(input: &str, extra: &Reserved) -> Result<Context, ParseError> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(ParseError::TooLong {
             len: input.len(),
@@ -226,7 +253,7 @@ pub fn parse(input: &str) -> Result<Context, ParseError> {
         .map_err(|e| ParseError::Syntax(first_line(&e.to_string())))?;
     let command = pairs.next().ok_or(ParseError::NoVerb)?;
 
-    let mut ctx = Context::new();
+    let mut ctx = Context::new_with(extra);
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     for pair in command.into_inner() {
@@ -490,8 +517,7 @@ mod tests {
 
     #[test]
     fn env_keys_can_be_reserved_too() {
-        let mut ctx = Context::new();
-        ctx.reserve("PVE_TOKEN");
+        let mut ctx = Context::new_with(&Reserved::new(["PVE_TOKEN"]));
         ctx.set_system("PVE_TOKEN", word("s3cret"));
         ctx.set_message("pve_token", word("stolen"));
         assert_eq!(ctx.get("pve_token"), Some(&word("s3cret")));

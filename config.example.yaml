@@ -1,12 +1,13 @@
-# meshbot-rs configuration — TEMPLATE ONLY.
+# meshbot-rs configuration.
 #
 # The real file lives on the host at /data/meshcore/meshbot-rs/config.yaml and
-# is mounted read-only. Nothing here is read by the container at build time.
+# is mounted read-only. This copy is what the test suite validates against, so
+# a schema change that breaks the example fails the build.
 #
-# This schema is NOT implemented yet; the loader comes with the rule engine.
-# The vocabulary in `verbs:` is the shape the hardcoded table in src/verbs.rs
-# produces today, so this file documents the target rather than a second
-# source of truth that already exists.
+# Validation is fatal, not advisory. An unknown key, a verb scoped to a channel
+# this file does not list, a script that is not in `script_dir`, a `${VAR}` or
+# an unknown `{{placeholder}}` in a template: each is a startup error. The bot
+# does not start with half a config.
 
 # Bumped on breaking changes. The binary refuses to start on a mismatch, so a
 # host config edited ahead of a deploy fails loudly instead of half-working.
@@ -26,13 +27,15 @@ schema: 1
 # smuggled in. Input over 64 bytes, or containing a newline, tab or carriage
 # return, is refused before parsing.
 #
-# Templates: `{{slot}}` for a declared value, `{{stdout}}` for clamped script
-# output, `${ENV}` for the environment. An unresolved placeholder fails at load,
-# not at message time.
+# Templates: `{{target}}` for the declared enum word, and `{{stdout}}` for
+# clamped script output in a `reply` only. Both are checked at load, so a typo
+# is a startup error rather than a literal `{{targt}}` on the air. `${ENV}` is
+# NOT supported — `.env` is read without expansion, so it would be sent
+# verbatim. A script reads a value from the environment instead, via `env:`.
 #
 # Reserved: a message cannot set `verb`, `channel`, `channel_idx`, `snr`,
-# `sender_timestamp`, `status`, `stdout`, `target` or any `${ENV}` name. A
-# collision poisons that key, so a rule reading it simply does not match.
+# `sender_timestamp`, `status`, `stdout`, `target`, or any name in an `env:`
+# list. A collision poisons that key, so a rule reading it does not match.
 
 bot:
   # Physical radio channel index -> expected channel name.
@@ -41,26 +44,29 @@ bot:
   # slots back with GET_CHANNEL and refuses to start on any mismatch, so a radio
   # re-layout can't silently point verbs at the wrong channel.
   #
+  # Matching is by index AND name, which is why the names have to be exact. The
+  # radio stores a name in 32 bytes with a NUL terminator, so anything past 31
+  # bytes is silently truncated; the loader warns at that boundary and a longer
+  # name is a startup error.
+  #
   # Never add a SET_CHANNEL call. That is the one command that engages the
   # proxy's channel virtualizer, which would remap these indices.
   channels:
     3: "#admin"
     4: "#homeassistant"
 
-  defaults:
-    action_timeout_secs: 10
-    # Bytes, not characters. MeshCore caps a channel payload at 160 bytes and
-    # `send_channel_msg` appends without checking, so an over-long reply hangs
-    # on the radio rather than truncating.
-    max_reply_bytes: 150
-    # How long a gated command stays armed. Single use, keyed on the canonical
-    # command, so `reboot alpha` and `REBOOT  alpha` share one armed state.
-    confirm_ttl_secs: 30
-    dedupe_window_secs: 300
+  # Reply length, the confirmation-latch window, and the default action timeout
+  # are code constants, not config: MAX_REPLY_BYTES, latch::CONFIRM_TTL_SECS,
+  # and script::DEFAULT_TIMEOUT_SECS. They are properties of the radio and the
+  # protocol rather than of a deployment — and an over-long reply hangs on the
+  # radio rather than truncating, so that one is not an operator's choice to
+  # make.
 
-  # Actions name a script inside this directory. A path that resolves outside it
-  # is rejected at load, and it is executed directly — never through a shell, so
-  # a template value can never be command injection.
+  # Actions name a script inside this directory. A name that resolves outside it
+  # is rejected at load, and the script is executed directly — never through a
+  # shell, so a template value can never be command injection.
+  # `MESHBOT_SCRIPT_DIR` overrides this, which is how the tracked templates in
+  # scripts.example/ are run locally.
   script_dir: /data/meshcore/meshbot-rs/scripts
 
 # `help` and `help <verb>` are built in and are not configurable: the reply is
@@ -76,22 +82,32 @@ verbs:
       env: [HA_URL, HA_TOKEN]
       reply: "{{stdout}}"
     args:
+      # The action is nested under `action:` rather than written inline beside
+      # `words`, so that every struct can use `deny_unknown_fields` and a
+      # mistyped key is a startup error instead of a silently ignored timeout.
+      #
+      # The service and entity are literals declared here, not in the script:
+      # `open` means `cover.open_cover` because this file says so, so the
+      # script is the same file on every install and no message can aim it at a
+      # different entity.
       - words: [arm, on, lock]
-        script: ha-service.sh
-        args: ["{{target}}"]
-        env: [HA_URL, HA_TOKEN]
-        mutating: true
-        # Idempotent on a private channel, so no latch. An alarm that is
-        # already armed is not a mistake worth a second message.
-        confirm: false
-        reply: "armed"
+        action:
+          script: ha-service.sh
+          args: ["alarm_control_panel.alarm_arm_home", "alarm_control_panel.alarm"]
+          env: [HA_URL, HA_TOKEN]
+          mutating: true
+          # Idempotent on a private channel, so no latch. An alarm that is
+          # already armed is not a mistake worth a second message.
+          confirm: false
+          reply: "armed"
       - words: [disarm, off]
-        script: ha-service.sh
-        args: ["{{target}}"]
-        env: [HA_URL, HA_TOKEN]
-        mutating: true
-        confirm: false
-        reply: "disarmed"
+        action:
+          script: ha-service.sh
+          args: ["alarm_control_panel.alarm_disarm", "alarm_control_panel.alarm"]
+          env: [HA_URL, HA_TOKEN]
+          mutating: true
+          confirm: false
+          reply: "disarmed"
 
   - name: garage
     desc: "garage state"
@@ -103,26 +119,29 @@ verbs:
       reply: "{{stdout}}"
     args:
       - words: [open, up]
-        script: ha-service.sh
-        args: ["{{target}}"]
-        env: [HA_URL, HA_TOKEN]
-        mutating: true
-        confirm: false
-        reply: "opening"
+        action:
+          script: ha-service.sh
+          args: ["cover.open_cover", "cover.garage"]
+          env: [HA_URL, HA_TOKEN]
+          mutating: true
+          confirm: false
+          reply: "opening"
       - words: [close, down]
-        script: ha-service.sh
-        args: ["{{target}}"]
-        env: [HA_URL, HA_TOKEN]
-        mutating: true
-        confirm: false
-        reply: "closing"
+        action:
+          script: ha-service.sh
+          args: ["cover.close_cover", "cover.garage"]
+          env: [HA_URL, HA_TOKEN]
+          mutating: true
+          confirm: false
+          reply: "closing"
       - words: [stop]
-        script: ha-service.sh
-        args: ["{{target}}"]
-        env: [HA_URL, HA_TOKEN]
-        mutating: true
-        confirm: false
-        reply: "stopped"
+        action:
+          script: ha-service.sh
+          args: ["cover.stop_cover", "cover.garage"]
+          env: [HA_URL, HA_TOKEN]
+          mutating: true
+          confirm: false
+          reply: "stopped"
 
   - name: internet
     desc: "link and internet reachability"
@@ -168,60 +187,66 @@ verbs:
     # Sys.PowerMgmt.
     args:
       - words: [alpha]
-        script: pve-reboot.sh
-        args: ["{{target}}", "100", "qemu"]
-        # An explicit allowlist: the subprocess must not inherit the bot's
-        # environment, or the channel secret and every other token land in
-        # every script.
-        #
-        # PVE_ALLOW_REBOOT is named here even though it is not a credential. The
-        # child's environment is emptied, so a variable this list omits is
-        # invisible to the script — which would pin the dry-run guard on and
-        # leave `reboot` permanently inert. Unset is a hard error naming the
-        # variable; `0` is a dry run; `1` reboots. One switch arms every word.
-        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
-        mutating: true
-        # A reboot is disruptive and not idempotent, and the reply travels after
-        # the machine is already going down. Worth the extra message.
-        confirm: true
-        reply: "{{stdout}}"
+        action:
+          script: pve-reboot.sh
+          args: ["{{target}}", "100", "qemu"]
+          # An explicit allowlist: the subprocess must not inherit the bot's
+          # environment, or the channel secret and every other token land in
+          # every script.
+          #
+          # PVE_ALLOW_REBOOT is named here even though it is not a credential.
+          # The child's environment is emptied, so a variable this list omits is
+          # invisible to the script — which would pin the dry-run guard on and
+          # leave `reboot` permanently inert. Unset is a hard error naming the
+          # variable; `0` is a dry run; `1` reboots. One switch arms every word.
+          env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+          mutating: true
+          # A reboot is disruptive and not idempotent, and the reply travels
+          # after the machine is already going down. Worth the extra message.
+          confirm: true
+          reply: "{{stdout}}"
 
       - words: [beta]
-        script: pve-reboot.sh
-        args: ["{{target}}", "101", "qemu"]
-        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
-        mutating: true
-        confirm: true
-        reply: "{{stdout}}"
+        action:
+          script: pve-reboot.sh
+          args: ["{{target}}", "101", "qemu"]
+          env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+          mutating: true
+          confirm: true
+          reply: "{{stdout}}"
 
       - words: [gamma]
-        script: pve-reboot.sh
-        args: ["{{target}}", "102", "lxc"]
-        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
-        mutating: true
-        confirm: true
-        reply: "{{stdout}}"
+        action:
+          script: pve-reboot.sh
+          args: ["{{target}}", "102", "lxc"]
+          env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+          mutating: true
+          confirm: true
+          reply: "{{stdout}}"
 
       - words: [delta]
-        script: pve-reboot.sh
-        args: ["{{target}}", "103", "qemu"]
-        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
-        mutating: true
-        confirm: true
-        reply: "{{stdout}}"
+        action:
+          script: pve-reboot.sh
+          args: ["{{target}}", "103", "qemu"]
+          env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+          mutating: true
+          confirm: true
+          reply: "{{stdout}}"
 
       - words: [komodo]
-        script: pve-reboot.sh
-        args: ["{{target}}", "104", "lxc"]
-        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
-        mutating: true
-        confirm: true
-        reply: "{{stdout}}"
+        action:
+          script: pve-reboot.sh
+          args: ["{{target}}", "104", "lxc"]
+          env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+          mutating: true
+          confirm: true
+          reply: "{{stdout}}"
 
       - words: [pve]
-        script: pve-reboot.sh
-        args: ["{{target}}", "-", "host"]
-        env: [PVE_URL, PVE_NODE, PVE_TOKEN_HOST, PVE_ALLOW_REBOOT]
-        mutating: true
-        confirm: true
-        reply: "{{stdout}}"
+        action:
+          script: pve-reboot.sh
+          args: ["{{target}}", "-", "host"]
+          env: [PVE_URL, PVE_NODE, PVE_TOKEN_HOST, PVE_ALLOW_REBOOT]
+          mutating: true
+          confirm: true
+          reply: "{{stdout}}"

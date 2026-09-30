@@ -21,7 +21,8 @@ pub const MAX_REPLY_BYTES: usize = 150;
 /// What an action runs. A script, never a URL: the path is declared in config
 /// and resolved against an allowlist, and the message can only pick which
 /// declared entry fires.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionSpec {
     pub script: String,
     /// Argument templates, e.g. `{{target}}`. They expand only to values the
@@ -33,21 +34,32 @@ pub struct ActionSpec {
     /// code in the script, so the same script file runs unchanged on every
     /// install. A literal is always operator-declared; the message only ever
     /// picks which declared entry fires, so a literal can never be steered.
+    #[serde(default)]
     pub args: Vec<String>,
     /// Names passed through from `.env`. An explicit allowlist: the subprocess
     /// must not inherit the bot's environment, or the channel secret and every
     /// other token land in every script.
+    #[serde(default)]
     pub env: Vec<String>,
     /// The action changes state. Implies a confirmation latch.
+    #[serde(default)]
     pub mutating: bool,
+    #[serde(default)]
     pub confirm: bool,
     /// Reply template. `{{stdout}}` is the script's clamped output.
     pub reply: String,
+    #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
 
 /// One enum value of a verb, e.g. `open` of `garage`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The action is nested under `action:` rather than inlined alongside `words`:
+/// inlining needs `serde(flatten)`, and `flatten` silently disables
+/// `deny_unknown_fields`, which is the one thing that catches a mistyped key in
+/// a config that is edited by hand on a host.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArgSpec {
     /// Accepted spellings, all case-insensitive. Declared here so aliases stay
     /// data and `help` can advertise them.
@@ -55,15 +67,20 @@ pub struct ArgSpec {
     pub action: ActionSpec,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbSpec {
     pub name: String,
+    #[serde(default)]
     pub desc: String,
     /// Channel this verb answers on. `None` means the config did not scope it,
     /// which the loader rejects — the listen set and the verb scopes must agree.
+    #[serde(default)]
     pub channel: Option<String>,
     /// The action for a bare `verb`, i.e. the status query.
+    #[serde(default)]
     pub get: Option<ActionSpec>,
+    #[serde(default)]
     pub args: Vec<ArgSpec>,
 }
 
@@ -373,183 +390,6 @@ pub fn with_system(ctx: &mut Context, channel: &str, channel_idx: u8) {
     ctx.set_system("channel_idx", Value::Int(i64::from(channel_idx)));
 }
 
-/// The verb set, hardcoded for now.
-///
-/// This is the shape the config loader will produce from `config.yaml`; until
-/// that exists it is the only place the language's vocabulary is defined. Note
-/// that nothing here is executed — the rule engine and `script.rs` land later —
-/// so a declared action is a declaration, not a capability.
-pub fn default_verbs() -> VerbTable {
-    const HA: &str = "#homeassistant";
-    const ADMIN: &str = "#admin";
-
-    let ha_env = || vec!["HA_URL".into(), "HA_TOKEN".into()];
-
-    // Read one entity's state. The entity id is a literal in config, never a
-    // message value, so a relayed message cannot aim this at a different one.
-    let status = |script: &str, args: &[&str]| ActionSpec {
-        script: script.into(),
-        args: args.iter().map(|a| (*a).to_string()).collect(),
-        env: ha_env(),
-        reply: "{{stdout}}".into(),
-        timeout_secs: Some(8),
-        ..ActionSpec::default()
-    };
-
-    // Call a Home Assistant service. Service and entity are declared per enum
-    // word, so the script stays dumb and needs no word-to-call mapping: the
-    // verb table is the only place that knows `open` means `cover.open_cover`.
-    let drive = |service: &str, entity: &str, reply: &str| ActionSpec {
-        script: "ha-service.sh".into(),
-        args: vec![service.into(), entity.into()],
-        env: ha_env(),
-        mutating: true,
-        confirm: false,
-        reply: reply.into(),
-        timeout_secs: Some(10),
-    };
-
-    // The word -> (vmid, kind, token) map is HERE, not in the script.
-    //
-    // Two reasons it moved out of `map_word`: the same script file then works
-    // unchanged on every install, with no per-deployment edit to a tracked
-    // template; and the kind selects the token, which is exactly the thing the
-    // script cannot decide for itself without learning what a guest id means.
-    //
-    // The ids below are PLACEHOLDERS — this repository is public, so publishing
-    // which host is which vmid on which hypervisor type is reconnaissance. The
-    // real map belongs in config.yaml, which is gitignored; it is not editable
-    // there yet because the config loader has not landed, so until it does this
-    // table is what the bot runs.
-    //
-    // `pve` is the node itself: `-` for the vmid, because /nodes/{node}/status/
-    // reboot has no vmid segment, and the host token because the guest token
-    // does not carry Sys.PowerMgmt.
-    let reboot = |vmid: &str, kind: &str, token: &str| ActionSpec {
-        script: "pve-reboot.sh".into(),
-        // arg 0 is the declared word, not the message text: `{{target}}`
-        // resolves to `words[0]`. It is a label for the reply and nothing else.
-        args: vec!["{{target}}".into(), vmid.into(), kind.into()],
-        // PVE_ALLOW_REBOOT has to be named here even though it is not a
-        // credential. The child's environment is emptied, so a variable the
-        // table does not declare is invisible to the script — which would leave
-        // the dry-run guard permanently on and `reboot` permanently inert.
-        // Declaring it makes the arming explicit: unset is a hard error naming
-        // the variable, and `0` is a dry run.
-        env: vec![
-            "PVE_URL".into(),
-            "PVE_NODE".into(),
-            token.into(),
-            "PVE_ALLOW_REBOOT".into(),
-        ],
-        mutating: true,
-        confirm: true,
-        reply: "{{stdout}}".into(),
-        timeout_secs: Some(10),
-    };
-
-    // Declaration order is the order `help reboot` and the "which word?" reply
-    // list them, and `primary_word` takes the first.
-    let reboot_targets: [(&str, &str, &str, &str); 6] = [
-        ("alpha", "100", "qemu", "PVE_TOKEN_GUEST"),
-        ("beta", "101", "qemu", "PVE_TOKEN_GUEST"),
-        ("gamma", "102", "lxc", "PVE_TOKEN_GUEST"),
-        ("delta", "103", "qemu", "PVE_TOKEN_GUEST"),
-        ("komodo", "104", "lxc", "PVE_TOKEN_GUEST"),
-        ("pve", "-", "host", "PVE_TOKEN_HOST"),
-    ];
-
-    VerbTable::new(vec![
-        VerbSpec {
-            name: "alarm".into(),
-            desc: "alarm state".into(),
-            channel: Some(HA.into()),
-            get: Some(status("ha-entity.sh", &["alarm_control_panel.alarm"])),
-            args: vec![
-                ArgSpec {
-                    words: vec!["arm".into(), "on".into(), "lock".into()],
-                    action: drive(
-                        "alarm_control_panel.alarm_arm_home",
-                        "alarm_control_panel.alarm",
-                        "armed",
-                    ),
-                },
-                ArgSpec {
-                    words: vec!["disarm".into(), "off".into()],
-                    action: drive(
-                        "alarm_control_panel.alarm_disarm",
-                        "alarm_control_panel.alarm",
-                        "disarmed",
-                    ),
-                },
-            ],
-        },
-        VerbSpec {
-            name: "garage".into(),
-            desc: "garage state".into(),
-            channel: Some(HA.into()),
-            get: Some(status("ha-entity.sh", &["cover.garage"])),
-            args: vec![
-                ArgSpec {
-                    words: vec!["open".into(), "up".into()],
-                    action: drive("cover.open_cover", "cover.garage", "opening"),
-                },
-                ArgSpec {
-                    words: vec!["close".into(), "down".into()],
-                    action: drive("cover.close_cover", "cover.garage", "closing"),
-                },
-                ArgSpec {
-                    words: vec!["stop".into()],
-                    action: drive("cover.stop_cover", "cover.garage", "stopped"),
-                },
-            ],
-        },
-        VerbSpec {
-            name: "internet".into(),
-            desc: "internet reachability".into(),
-            channel: Some(ADMIN.into()),
-            get: Some(ActionSpec {
-                script: "internet-status.sh".into(),
-                args: vec!["8.8.8.8".into(), "1.1.1.1".into()],
-                // No env: the targets are literals. The script needs raw
-                // sockets, or CAP_NET_RAW, to ping from inside the container.
-                env: vec![],
-                reply: "{{stdout}}".into(),
-                timeout_secs: Some(8),
-                ..ActionSpec::default()
-            }),
-            args: vec![],
-        },
-        VerbSpec {
-            name: "komodo".into(),
-            desc: "komodo state".into(),
-            channel: Some(ADMIN.into()),
-            get: Some(ActionSpec {
-                script: "komodo-status.sh".into(),
-                args: vec![],
-                env: vec!["KOMODO_URL".into(), "KOMODO_TOKEN".into()],
-                reply: "{{stdout}}".into(),
-                timeout_secs: Some(8),
-                ..ActionSpec::default()
-            }),
-            args: vec![],
-        },
-        VerbSpec {
-            name: "reboot".into(),
-            desc: "restart a machine".into(),
-            channel: Some(ADMIN.into()),
-            get: None,
-            args: reboot_targets
-                .iter()
-                .map(|(word, vmid, kind, token)| ArgSpec {
-                    words: vec![(*word).into()],
-                    action: reboot(vmid, kind, token),
-                })
-                .collect(),
-        },
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,7 +513,7 @@ mod tests {
     /// message would not improve.
     #[test]
     fn only_reboot_asks_for_confirmation() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         for verb in &table.verbs {
             for arg in &verb.args {
                 assert_eq!(
@@ -697,7 +537,7 @@ mod tests {
     /// the only destructive action in the service.
     #[test]
     fn the_reboot_guard_is_in_the_env_allowlist() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         let reboot = table.get("reboot").expect("reboot is declared");
         for arg in &reboot.args {
             assert!(
@@ -718,7 +558,7 @@ mod tests {
     /// name a file or open a quoted string if a script ever re-parsed its argv.
     #[test]
     fn no_action_argument_carries_a_path_or_a_quote() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         for verb in &table.verbs {
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
             for action in actions {
@@ -748,7 +588,7 @@ mod tests {
     /// the air. So both are pinned here rather than left to review.
     #[test]
     fn reboot_declares_the_id_kind_and_token_of_each_word() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         let reboot = table.get("reboot").expect("reboot is declared");
 
         for arg in &reboot.args {
@@ -915,7 +755,7 @@ mod tests {
             "pve-reboot.sh",
         ];
 
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         for name in table.names() {
             let verb = table.get(name).unwrap();
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
@@ -933,7 +773,7 @@ mod tests {
     /// later `mutating: false` typo would quietly drop the confirmation.
     #[test]
     fn confirm_implies_mutating() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         for name in table.names() {
             let verb = table.get(name).unwrap();
             for arg in &verb.args {
@@ -950,7 +790,7 @@ mod tests {
     /// empty environment, not an inherited one.
     #[test]
     fn every_script_that_needs_a_secret_declares_its_env() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         for name in table.names() {
             let verb = table.get(name).unwrap();
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
@@ -969,7 +809,7 @@ mod tests {
 
     #[test]
     fn the_default_verb_set_resolves_and_fits_the_budget() {
-        let table = default_verbs();
+        let table = &crate::config::example().table;
         for name in table.names() {
             // A bare verb is actionable only where the config declares a status
             // query; `reboot` has none, and `help` is handled before the table.

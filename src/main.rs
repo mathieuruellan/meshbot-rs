@@ -1,13 +1,15 @@
 //! meshbot-rs — MeshCore channel rule/action bot.
 //!
-//! Connects to the radio over TCP, verifies the channel map it was configured
-//! with, then streams channel messages. A message is parsed into a command
-//! context, resolved against the verb table, and either answered or run as the
-//! script the verb table names for it.
+//! Connects to the radio over TCP, verifies the channel map from `config.yaml`,
+//! then streams channel messages. A message is parsed into a command context,
+//! resolved against the verb table, and either answered or run as the script the
+//! config names for it.
 //!
-//! Not yet wired: the config loader, so [`verbs::default_verbs`] is still the
-//! vocabulary rather than `config.yaml`. See `verbs::default_verbs`.
+//! The vocabulary is data, not code: which channels are listened to, which verbs
+//! exist and which script each one runs all come from `config.yaml`, validated
+//! at startup. See `config`.
 
+mod config;
 mod latch;
 mod parse;
 mod script;
@@ -19,12 +21,6 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use meshcore_rs::{EventPayload, EventType, MeshCore};
 use parse::ParseError;
-
-/// Physical channel index -> expected channel name.
-///
-/// These are the *radio's* real indices. We never send `SET_CHANNEL`, so the
-/// proxy's virtualizer never maps us and the indices pass through unchanged.
-const CHANNELS: &[(u8, &str)] = &[(3, "#admin"), (4, "#homeassistant")];
 
 /// How many channel slots to read back when verifying the map.
 const CHANNEL_SLOTS: u8 = 8;
@@ -39,6 +35,17 @@ async fn main() -> Result<()> {
         .init();
 
     dotenvy::dotenv().ok();
+
+    let config_path =
+        std::env::var("MESHBOT_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
+    let loaded = config::load(std::path::Path::new(&config_path))?;
+    let script_dir = script_dir()?;
+    tracing::info!(
+        config = %config_path,
+        channels = loaded.channels.len(),
+        verbs = loaded.table.names().join(" "),
+        "config loaded"
+    );
 
     let host = std::env::var("MESHCORE_HOST").unwrap_or_else(|_| "proxy".to_string());
     let port: u16 = std::env::var("MESHCORE_PORT")
@@ -61,23 +68,25 @@ async fn main() -> Result<()> {
         .context("send_appstart failed")?;
     tracing::info!(name = %info.name, "app started");
 
-    verify_channels(&meshcore).await?;
+    verify_channels(&meshcore, &loaded.channels).await?;
 
     // Returns unit, not a Result — there is nothing to await that can fail.
     meshcore.start_auto_message_fetching().await;
     tracing::info!("listening for channel messages");
 
-    let table = verbs::default_verbs();
-    let script_dir = script_dir()?;
     let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
 
     let mut stream = meshcore.event_stream_filtered(EventType::ChannelMsgRecv);
     while let Some(event) = stream.next().await {
         if let EventPayload::ChannelMessage(msg) = event.payload {
-            let Some((_, name)) = CHANNELS.iter().find(|(idx, _)| *idx == msg.channel_idx) else {
-                // Not in the listen set. `CHANNELS` is both the filter and the
-                // startup assertion, so a message from anywhere else is dropped
-                // before it is even parsed.
+            let Some((_, name)) = loaded
+                .channels
+                .iter()
+                .find(|(idx, _)| *idx == msg.channel_idx)
+            else {
+                // Not in the listen set. The channel map is both the filter and
+                // the startup assertion, so a message from anywhere else is
+                // dropped before it is even parsed.
                 tracing::debug!(channel_idx = msg.channel_idx, "channel not monitored");
                 continue;
             };
@@ -92,7 +101,7 @@ async fn main() -> Result<()> {
             // their scripts or their replies.
             handle_message(
                 &meshcore,
-                &table,
+                &loaded,
                 &mut latch,
                 &script_dir,
                 &msg.text,
@@ -111,8 +120,9 @@ async fn main() -> Result<()> {
 /// A missing directory is a hard startup failure rather than a warning: the
 /// compose file mounts it, so its absence means the mount is wrong, and a bot
 /// that answers `garage` with "action failed" while looking healthy hides the
-/// real problem. `MESHBOT_SCRIPT_DIR` overrides it, which is how the tracked
-/// templates in `scripts.example/` are exercised without a deploy.
+/// real problem. The config loader has already canonicalized it — it validates
+/// every declared script name against this directory — so this re-reads it only
+/// to log where it is.
 fn script_dir() -> Result<PathBuf> {
     let dir = script::script_dir();
     std::fs::canonicalize(&dir).with_context(|| {
@@ -164,12 +174,13 @@ impl Decision<'_> {
 /// Decide what one inbound message means. Pure apart from the latch's clock.
 fn decide<'a>(
     table: &'a verbs::VerbTable,
+    reserved: &parse::Reserved,
     latch: &mut latch::Latch,
     text: &str,
     channel: &str,
     channel_idx: u8,
 ) -> Decision<'a> {
-    let mut ctx = match parse::parse(text) {
+    let mut ctx = match parse::parse_with(text, reserved) {
         Ok(ctx) => ctx,
         Err(err) => {
             // Not a command, so no reply: these channels are not exclusively
@@ -267,14 +278,14 @@ fn decide<'a>(
 /// One inbound message, end to end. I/O only: [`decide`] has already decided.
 async fn handle_message(
     meshcore: &MeshCore,
-    table: &verbs::VerbTable,
+    config: &config::Loaded,
     latch: &mut latch::Latch,
     dir: &Path,
     text: &str,
     channel: &str,
     channel_idx: u8,
 ) {
-    match decide(table, latch, text, channel, channel_idx) {
+    match decide(&config.table, &config.reserved, latch, text, channel, channel_idx) {
         Decision::Ignore => {}
         Decision::Reply(reply) => send(meshcore, channel_idx, &reply).await,
         Decision::Execute { action, ctx } => {
@@ -335,11 +346,14 @@ async fn send(meshcore: &MeshCore, channel_idx: u8, reply: &str) {
     }
 }
 
-/// Read the radio's channel table back and fail if it disagrees with `CHANNELS`.
+/// Read the radio's channel table back and fail if it disagrees with the config.
+///
+/// `channels` is the config's `bot.channels`, so the listen set and the startup
+/// assertion are the same declaration: there is no second list to drift.
 ///
 /// Read-only: this issues `GET_CHANNEL` only. `SET_CHANNEL` would be the one
 /// call that puts us in the proxy's virtualizer and remaps indices.
-async fn verify_channels(meshcore: &MeshCore) -> Result<()> {
+async fn verify_channels(meshcore: &MeshCore, channels: &[(u8, String)]) -> Result<()> {
     let commands = meshcore.commands().lock().await;
 
     for idx in 0..CHANNEL_SLOTS {
@@ -353,14 +367,17 @@ async fn verify_channels(meshcore: &MeshCore) -> Result<()> {
             }
         };
 
-        let expected = CHANNELS.iter().find(|(i, _)| *i == idx).map(|(_, n)| *n);
+        let expected = channels
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, n)| n.as_str());
         match expected {
             Some(name) if info.name == name => {
                 tracing::info!(channel_idx = idx, name = %info.name, "channel verified");
             }
             Some(name) => {
                 anyhow::bail!(
-                    "channel {idx} is {:?} but this build expects {name:?}; \
+                    "channel {idx} is {:?} but config expects {name:?}; \
                      the radio layout has drifted — refusing to start",
                     info.name
                 );
@@ -379,8 +396,15 @@ mod tests {
     const ADMIN: &str = "#admin";
     const HA: &str = "#homeassistant";
 
-    fn table() -> verbs::VerbTable {
-        verbs::default_verbs()
+    /// The verb table and the channel map, both from the shipped example config,
+    /// so the tests assert against what the repository documents rather than
+    /// against a table that only exists in Rust.
+    fn config() -> &'static config::Loaded {
+        config::example()
+    }
+
+    fn table() -> &'static verbs::VerbTable {
+        &config().table
     }
 
     /// Run one message through the whole policy and return what it decided.
@@ -390,12 +414,14 @@ mod tests {
         text: &str,
         channel: &str,
     ) -> Decision<'a> {
-        let idx = CHANNELS
+        let loaded = config();
+        let idx = loaded
+            .channels
             .iter()
-            .find(|(_, n)| *n == channel)
+            .find(|(_, n)| n == channel)
             .map(|(i, _)| *i)
-            .unwrap();
-        decide(table, latch, text, channel, idx)
+            .expect("channel is in the listen set");
+        decide(table, &loaded.reserved, latch, text, channel, idx)
     }
 
     // ---- the latch, which is the only thing standing between a message and a
@@ -406,11 +432,11 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
 
-        let first = run_on(&table, &mut latch, "reboot alpha", ADMIN);
+        let first = run_on(table, &mut latch, "reboot alpha", ADMIN);
         assert!(!first.is_execute(), "one message must not reboot");
         assert_eq!(first.reply(), Some("confirm: 'reboot alpha ok'"));
 
-        let second = run_on(&table, &mut latch, "reboot alpha ok", ADMIN);
+        let second = run_on(table, &mut latch, "reboot alpha ok", ADMIN);
         assert!(second.is_execute(), "the confirmation must run");
     }
 
@@ -421,8 +447,8 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
 
-        run_on(&table, &mut latch, "reboot alpha", ADMIN);
-        let second = run_on(&table, &mut latch, "REBOOT  AlPhA  ok", ADMIN);
+        run_on(table, &mut latch, "reboot alpha", ADMIN);
+        let second = run_on(table, &mut latch, "REBOOT  AlPhA  ok", ADMIN);
         assert!(second.is_execute());
     }
 
@@ -433,8 +459,8 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
 
-        run_on(&table, &mut latch, "reboot alpha", ADMIN);
-        let wrong = run_on(&table, &mut latch, "reboot beta ok", ADMIN);
+        run_on(table, &mut latch, "reboot alpha", ADMIN);
+        let wrong = run_on(table, &mut latch, "reboot beta ok", ADMIN);
         assert!(!wrong.is_execute());
         assert_eq!(
             wrong.reply(),
@@ -443,14 +469,14 @@ mod tests {
         assert!(latch.is_armed("reboot alpha"), "alpha was spent");
 
         // And the original arming still works afterwards.
-        assert!(run_on(&table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
+        assert!(run_on(table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
     }
 
     #[test]
     fn a_confirmation_with_nothing_armed_does_not_run() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        let d = run_on(&table, &mut latch, "reboot alpha ok", ADMIN);
+        let d = run_on(table, &mut latch, "reboot alpha ok", ADMIN);
         assert!(!d.is_execute());
         assert!(d.reply().is_some());
     }
@@ -461,8 +487,8 @@ mod tests {
     fn an_expired_arming_does_not_run() {
         let table = table();
         let mut latch = latch::Latch::new(0);
-        run_on(&table, &mut latch, "reboot alpha", ADMIN);
-        assert!(!run_on(&table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
+        run_on(table, &mut latch, "reboot alpha", ADMIN);
+        assert!(!run_on(table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
     }
 
     /// A replayed confirmation must not reboot twice.
@@ -470,9 +496,9 @@ mod tests {
     fn a_confirmation_runs_only_once() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        run_on(&table, &mut latch, "reboot alpha", ADMIN);
-        assert!(run_on(&table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
-        assert!(!run_on(&table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
+        run_on(table, &mut latch, "reboot alpha", ADMIN);
+        assert!(run_on(table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
+        assert!(!run_on(table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
     }
 
     /// `garage open` is mutating but idempotent, so it runs in one message — and
@@ -481,7 +507,7 @@ mod tests {
     fn a_stray_ok_on_a_ungated_verb_does_nothing() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        let d = run_on(&table, &mut latch, "garage open ok", HA);
+        let d = run_on(table, &mut latch, "garage open ok", HA);
         assert!(!d.is_execute());
         assert_eq!(d.reply(), Some("'ok' only follows a two-step command"));
     }
@@ -490,8 +516,8 @@ mod tests {
     fn an_ungated_mutating_action_runs_in_one_message() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        assert!(run_on(&table, &mut latch, "garage open", HA).is_execute());
-        assert!(run_on(&table, &mut latch, "alarm arm", HA).is_execute());
+        assert!(run_on(table, &mut latch, "garage open", HA).is_execute());
+        assert!(run_on(table, &mut latch, "alarm arm", HA).is_execute());
     }
 
     // ---- channel scope
@@ -503,17 +529,17 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
 
-        let bare = run_on(&table, &mut latch, "reboot alpha", HA);
+        let bare = run_on(table, &mut latch, "reboot alpha", HA);
         assert!(!bare.is_execute());
         assert_eq!(bare.reply(), Some("reboot: not on this channel"));
 
         // Not even the confirmation path, and nothing was armed as a side effect.
-        let confirmed = run_on(&table, &mut latch, "reboot alpha ok", HA);
+        let confirmed = run_on(table, &mut latch, "reboot alpha ok", HA);
         assert!(!confirmed.is_execute());
         assert_eq!(latch.armed_count(), 0, "out-of-scope armed something");
 
         // And on the right channel it still arms.
-        assert!(!run_on(&table, &mut latch, "reboot alpha", ADMIN).is_execute());
+        assert!(!run_on(table, &mut latch, "reboot alpha", ADMIN).is_execute());
         assert_eq!(latch.armed_count(), 1);
     }
 
@@ -522,7 +548,7 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
         for input in ["garage", "garage open", "alarm arm"] {
-            let d = run_on(&table, &mut latch, input, ADMIN);
+            let d = run_on(table, &mut latch, input, ADMIN);
             assert!(!d.is_execute(), "{input} ran on {ADMIN}");
         }
     }
@@ -534,7 +560,7 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
         for channel in [ADMIN, HA] {
-            let d = run_on(&table, &mut latch, "help", channel);
+            let d = run_on(table, &mut latch, "help", channel);
             assert!(d.reply().is_some(), "no help on {channel}");
         }
     }
@@ -552,7 +578,7 @@ mod tests {
             "reboot alpha channel_idx=9",
             "garage channel=#admin",
         ] {
-            let d = run_on(&table, &mut latch, input, ADMIN);
+            let d = run_on(table, &mut latch, input, ADMIN);
             assert!(!d.is_execute(), "{input} ran");
             assert_eq!(d.reply(), None, "{input} was answered");
         }
@@ -565,7 +591,7 @@ mod tests {
     fn a_target_spoof_does_not_change_what_runs() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        let d = run_on(&table, &mut latch, "reboot target=beta", ADMIN);
+        let d = run_on(table, &mut latch, "reboot target=beta", ADMIN);
         assert!(!d.is_execute());
     }
 
@@ -587,7 +613,7 @@ mod tests {
             &too_long,
             "reboot alpha beta",
         ] {
-            let d = run_on(&table, &mut latch, input, HA);
+            let d = run_on(table, &mut latch, input, HA);
             assert!(!d.is_execute(), "{input:?} ran");
             assert_eq!(d.reply(), None, "{input:?} was answered");
         }
@@ -601,7 +627,7 @@ mod tests {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
         for (input, expected) in [("hello", None), ("gerage", Some("garage"))] {
-            let d = run_on(&table, &mut latch, input, HA);
+            let d = run_on(table, &mut latch, input, HA);
             let reply = d.reply().expect("a reply");
             if let Some(expected) = expected {
                 assert!(reply.contains(expected), "{reply}");
@@ -615,7 +641,7 @@ mod tests {
     fn a_typo_gets_a_pointer_not_a_rejection() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        let d = run_on(&table, &mut latch, "gerage", HA);
+        let d = run_on(table, &mut latch, "gerage", HA);
         let reply = d.reply().expect("a suggestion");
         assert!(reply.contains("garage"), "{reply}");
     }

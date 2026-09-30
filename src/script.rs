@@ -515,7 +515,7 @@ mod tests {
     fn each_declared_word_produces_the_command_its_entry_declares() {
         let dir = sandbox("reboot-argv");
         write_script(&dir, "pve-reboot.sh", "#!/bin/sh\nexit 0\n");
-        let table = crate::verbs::default_verbs();
+        let table = &crate::config::example().table;
         let reboot = table.get("reboot").expect("reboot is declared");
 
         let expected = [
@@ -554,7 +554,7 @@ mod tests {
     /// message can pick a machine, never invent one.
     #[test]
     fn an_undeclared_word_fires_nothing() {
-        let table = crate::verbs::default_verbs();
+        let table = &crate::config::example().table;
         let ctx = parse::parse("reboot myPersonalServer").unwrap();
         assert!(!table.resolve(&ctx).is_actionable());
     }
