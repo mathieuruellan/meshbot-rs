@@ -1,0 +1,25 @@
+# Build context. The Dockerfile only copies Cargo.toml, Cargo.lock and src/, so
+# most of this is belt-and-braces — it keeps the context small and, more
+# importantly, makes it structurally impossible to bake a real secret into a
+# published layer.
+
+target/
+.git/
+.github/
+
+# The single source for tokens. Never in an image, even accidentally.
+.env
+# Host-owned config. Nothing reads it inside the container yet, but the loader
+# will, and the mount is the point.
+config.yaml
+
+# Deployed action scripts are host-owned and gitignored; scripts.example/ are
+# templates. Neither belongs in an image, and shipping the templates would be
+# an easy way for someone to mistake them for the real ones.
+scripts/
+scripts.example/
+
+# Not needed to compile.
+*.md
+Dockerfile
+.dockerignore

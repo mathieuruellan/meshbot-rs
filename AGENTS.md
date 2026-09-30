@@ -61,17 +61,113 @@ Two repos, two triggers. This one publishes an image; it is never built by
 `meshcore`.
 
 ```
-push meshbot-rs  →  GitHub Actions  →  ghcr.io/mathieuruellan/meshbot-rs:<tag>
-                                            ↓  Renovate bumps the tag
-push meshcore    →  Komodo           →  host pulls the pinned image
+feat:/fix: → main   →  CI          →  ghcr.io/…/meshbot-rs:latest
+merge release PR     →  tag v0.1.1  →  CI  →  …/meshbot-rs:0.1.1  ← Renovate pins this
+push meshcore         →  Komodo     →  host pulls the pinned image
 ```
 - `meshcore/compose.yaml` pins a **tag**; there is no `build:` anywhere.
 - Runtime config is **host-owned**, mounted read-only from
   `/data/meshcore/meshbot-rs/{config.yaml,.env}`. Editing config and restarting
   the container requires no rebuild.
 - `.env` and `config.yaml` are gitignored; only the `.example` files are tracked.
-- **There is no CI workflow yet.** The GHCR publish step described above is the
-  intended design, not something that exists.
+- `latest` moves on **every** merge to `main` and is not a release. The pinned
+  tag only moves when a release PR is merged. Those are two separate deploy
+  paths; the unpinned one is for testing a change, the pinned one is the host.
+
+## CI and releases
+`.github/workflows/ci.yml` and `.github/workflows/release.yml` exist. Three
+jobs in `ci.yml`:
+
+| job | runs on | does |
+|---|---|---|
+| `commitlint` | pull requests | Conventional Commit title check |
+| `checks` | every push and PR | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
+| `image` | pushes to `main` and to `v*` tags | buildx build, push to GHCR, gated on `checks` |
+
+Image tags, from `docker/metadata-action`: on `main` → `main`, `sha-<full>`,
+`latest`; on a `v*` tag → the bare version (`0.1.1`), `sha-<full>`, `latest`. The
+bare form is the one Renovate bumps cleanly in compose. If compose pins `v0.1.1`
+instead, add `type=semver,pattern=v{{version}}` to the tag list.
+
+**`checks` is deliberately unconditional**, including on tag pushes. A `needs:`
+on a conditionally-skipped job skips its dependents, so making `checks`
+tag-conditional would silently stop the released image from ever being built.
+
+Version comes from the commit messages, via release-please:
+
+| commit | bump | in the changelog |
+|---|---|---|
+| `fix:`, `perf:`, `revert:`, `chore:`, `ci:`, `docs:`, `test:`, `refactor:`, `build:`, `style:` | patch | only the non-hidden ones |
+| `feat:` | minor | yes |
+| `feat!:` or a `BREAKING CHANGE:` footer | major | yes |
+
+Two consequences worth knowing before editing the workflows:
+
+- **release-please never releases on its own.** It opens or updates a release
+  PR; merging *that* is what creates the tag, the GitHub Release, and the
+  versioned image. A `chore:` merge therefore queues a release PR with an empty
+  changelog body — that is intended, not a bug. Do not merge it unless you want
+  the version to move.
+- **The `commitlint` job is the only thing stopping a non-conventional title
+  from merging.** A squash-merge title that is not a Conventional Commit is
+  dropped by release-please's commit splitter, so that work would move no
+  version and appear in no changelog. Enable required status checks in the repo
+  settings, or the job can be bypassed.
+
+The toolchain is pinned twice and the two cannot read each other:
+`rust-toolchain.toml` (`channel = "1.98.1"`, which also gives local builds the
+same compiler CI uses) and `ARG RUST_VERSION` in the Dockerfile (a minor, since
+the tag is `rust:1.98-slim-bookworm`). Bump them together. Current stable Rust
+is 1.98.1; edition 2024 needs 1.85 or newer.
+
+### The image, and what it deliberately does not do
+Runtime is `debian:bookworm-slim` plus `bash`, `ca-certificates`, `curl`, `jq`,
+`iputils-ping` and `netbase`. That list is not decoration: the executor calls
+`env_clear()` and then adds only the names a verb entry declares, so **a script
+has no `PATH` and every binary it calls has to exist in the image at an absolute
+path.** Adding a tool to the image is the only way a script can reach it. A
+script naming something that is not installed fails at message time, not at
+build time.
+
+Two things the Dockerfile pointedly does *not* do:
+
+- **It does not create the script allowlist directory.** `script_dir()`
+  canonicalizes it and treats absence as a hard startup error, so an absent
+  compose mount stops the bot loudly instead of leaving it answering every
+  command with "action failed" while looking healthy.
+- **It does not bake in `.env` or `config.yaml`.** `.dockerignore` excludes them,
+  so a local token file cannot reach a published layer by accident.
+
+`WORKDIR /data/meshcore/meshbot-rs` exists only so `dotenvy` finds the
+host-mounted `.env`: it searches upward from the current directory, so with
+`CWD=/` it would never look in `/data` at all. `main.rs` ignores the dotenv
+error, so a wrong `WORKDIR` does not fail startup — it leaves every credential
+missing until an action runs.
+
+The container runs as uid 1000, so **everything mounted under
+`/data/meshcore/meshbot-rs` must be world readable and traversable** (`0644` /
+`0755`, not `0600`). `scripts.example/README.md` already installs `0755`; `.env`
+and `config.yaml` are the exposure, and they are the two files that must not be
+`0600`.
+
+### First publish, by hand
+A package published to GHCR with `GITHUB_TOKEN` is created **private**, and
+Actions cannot change that. Until it is set to Public in the package settings,
+`docker pull` from the host fails with `unauthorized`. The
+`org.opencontainers.image.source` label in the Dockerfile is what links the
+package to this repository, which is what lets the workflow keep pushing to it
+on later runs; it grants permission inheritance, not visibility.
+
+### ping needs a capability
+Docker grants neither `CAP_NET_RAW` nor a widened `ping_group_range`, so without
+one of them `ping` fails and `internet-status.sh` falls through to its `/dev/tcp`
+branch. That branch is **bash-only** (`/dev/tcp` is not POSIX), so under dash
+every target reports `down` — the check lies rather than erroring. Apply the
+compose change in the same deploy as the image, not after:
+
+```yaml
+cap_add: [NET_RAW]    # or: sysctls: {net.ipv4.ping_group_range: "0 2147483647"}
+```
 
 ## meshcore-rs 0.2.0 — trust the compiler, not the README
 Pinned exactly (`=0.2.0`) because the crate is young (~2k downloads, 76%

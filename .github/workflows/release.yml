@@ -1,0 +1,46 @@
+name: Release
+
+# Decides the next version from the commit messages and opens a pull request
+# that does it. It never releases on its own: merging the release PR is what
+# creates the tag, the GitHub Release, and — via the tag push — the versioned
+# image in ci.yml.
+#
+# Commit message to version, for the whole range since the last release:
+#
+#   fix: / perf: / revert: / anything else  -> patch
+#   feat:                                    -> minor
+#   feat!: or a BREAKING CHANGE: footer      -> major
+#
+# `chore:`, `ci:`, `docs:`, `test:`, `refactor:`, `build:` and `style:` fall into
+# the patch case, so merging one queues a release PR with an empty changelog
+# body. That is deliberate: the image did change, and the version a host pins
+# should say so. Just do not merge the release PR unless you want the tag.
+#
+# The pipeline is idle until the first conventional commit lands. The two
+# existing commits are not conventional, so release-please sees nothing to do.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  # Queue rather than cancel: two releases must never interleave.
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Open or update the release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

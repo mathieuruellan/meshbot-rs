@@ -1,0 +1,142 @@
+name: CI
+
+# Two things happen here and they are not the same thing:
+#
+#   push to main  -> checks, then a `latest` image. Not a release.
+#   push tag v*   -> checks, then that version's image. This is the release.
+#
+# The version is decided by release-please from the commit messages, so the
+# commitlint job below is what keeps that decision honest: a squash-merge title
+# becomes the main-branch commit message, and that message is the only input the
+# version has.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; the image job opts up to packages: write.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded PR builds, but never a main push or a tag: those are the
+  # ones that publish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  commitlint:
+    name: Conventional commit title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        with:
+          # Listed explicitly rather than left to the action's default, so that
+          # adding a type here is a deliberate act.
+          types: |
+            feat
+            fix
+            perf
+            revert
+            deps
+            refactor
+            docs
+            test
+            build
+            ci
+            chore
+          requireScope: false
+          # GitHub suggests the single commit message as the squash title, and
+          # it is easy to accept that by accident. The squash title is what
+          # release-please reads, so both have to be conventional.
+          validateSingleCommit: true
+
+  checks:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Scoped per event and ref, so a pull request cannot seed the build
+          # cache that a main or tag build later reads back.
+          key: ${{ github.event_name }}-${{ github.ref_name }}
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- --deny warnings
+
+      - name: cargo test
+        run: cargo test
+
+  image:
+    name: Build and push image
+    # `needs: checks` on a conditionally-skipped job skips its dependents, so
+    # `checks` is deliberately unconditional — it also runs on a tag push, which
+    # is a second gate on the released image rather than wasted work.
+    needs: checks
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # On main:      main, sha-<full>, latest
+          # On tag v0.1.1: 0.1.1, sha-<full>, latest
+          #
+          # The bare `{{version}}` form is the one Renovate bumps cleanly in
+          # the meshcore compose file. The Dockerfile owns
+          # org.opencontainers.image.source, so it is not repeated here.
+          tags: |
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.version={{version}}
+            org.opencontainers.image.revision={{sha}}
+            org.opencontainers.image.created={{timestamp}}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          # The meshbot host is x86-64. Adding arm64 here would bring QEMU
+          # emulation of a full Rust build, which roughly doubles this job.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -57,10 +57,22 @@ Two rules the executor enforces, which these scripts rely on:
 - **The environment is emptied first**, then the allowlisted names are added.
   Without `PATH`, so quote any path you use, and expect nothing else to be set.
 
-That second point is why these scripts use `#!/bin/sh` (an absolute path) and
-absolute paths for `curl`, `jq` and `ping`. `command -v` still works because
-`sh` has a built-in default PATH for lookups; if it does not in your shell, use
-absolute paths.
+That second point is why these scripts use `#!/bin/sh` — the kernel resolves
+that shebang as an absolute path, before any environment exists, so it cannot
+depend on `PATH` either.
+
+The tools themselves are called by bare name, and that is safe by a narrower
+margin: a POSIX shell installs a built-in default `PATH` when it starts with
+none set, so `curl`, `jq`, `timeout` and `ping` resolve under
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` even though the
+environment arrived empty. In the published image that puts them at
+`/usr/bin/curl`, `/usr/bin/jq`, `/usr/bin/ping` and `/usr/bin/timeout`.
+
+So the contract is not "use absolute paths" — it is **"the tool has to be in
+one of those default directories."** A tool installed elsewhere, or one whose
+package drops it outside them, silently becomes unreachable. `command -v` works
+for the same reason, so it is a valid way to check a dependency from inside a
+script.
 
 The same point cuts the other way, and it is easy to get wrong: **a variable the
 verb entry does not name is invisible to the script.** `PVE_ALLOW_REBOOT` is a
@@ -162,6 +174,30 @@ the script's:
 
 ## Requirements
 
-`curl` and `jq` on the host, plus `ping` for the internet check — or no `ping`
-binary at all, in which case `internet-status.sh` falls back to a `/dev/tcp`
-connect, which is unprivileged but only proves port 443 opens.
+The scripts run **inside the bot container**, so their tools come from the
+image, not from the host. The runtime stage of the `Dockerfile` is
+`debian:bookworm-slim` plus exactly:
+
+| tool | needed by |
+|---|---|
+| `bash` | any template that prefers `#!/bin/bash` over `#!/bin/sh` |
+| `ca-certificates` | every `curl` call — without a trust store TLS to HA, Komodo and PVE fails |
+| `curl` | `ha-entity.sh`, `ha-service.sh`, `komodo-status.sh`, `pve-reboot.sh` |
+| `jq` | the same four, for reading their JSON |
+| `iputils-ping` | `internet-status.sh` |
+| `netbase` | `/etc/protocols` and `/etc/services`, which `iputils-ping` drops |
+
+`timeout` and `sleep`, used by `internet-status.sh` and `pve-reboot.sh`, come
+from coreutils, which the base image already has.
+
+That list is closed. A script naming a tool that is not installed **fails at
+message time, not at build time** — the bot has no way to know what a script
+needs. So adding a tool means editing the `apt-get install` line in the
+`Dockerfile` in the same change that introduces the script, and installing it
+somewhere under `/bin` or `/usr/bin`, because that is all the shell's default
+`PATH` reaches.
+
+`ping` needs `CAP_NET_RAW` or a widened `net.ipv4.ping_group_range`; Docker
+grants neither by default. See the capability note in `AGENTS.md` — without one
+of them this script falls through to its `/dev/tcp` branch, which is bash-only
+and so reports everything `down` under `sh`.
