@@ -2,8 +2,10 @@ name: CI
 
 # Two things happen here and they are not the same thing:
 #
-#   push to main  -> checks, then a `latest` image. Not a release.
-#   push tag v*   -> checks, then that version's image. This is the release.
+#   push to main  -> checks, then a `latest` image. Plus the versioned image
+#                    when that push is the merge of a release-please release PR.
+#   push tag v*   -> checks, then that version's image. Never actually fires:
+#                    see the note on the "Resolve tags" step.
 #
 # The version is decided by release-please from the commit messages, so the
 # commitlint job below is what keeps that decision honest: a squash-merge title
@@ -110,6 +112,10 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history, because the next step compares HEAD against its parent.
+          # The default depth of 1 leaves no HEAD^ and the comparison fails.
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v4
 
@@ -119,23 +125,60 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The versioned tag, decided here rather than by the tag push.
+      #
+      # GitHub does not start workflow runs for events created by GITHUB_TOKEN,
+      # and release-please creates its tag with exactly that token. So a tag push
+      # never reaches this workflow: `latest` and `sha-<full>` move, the release
+      # looks like it worked, and the bare version the host pins never appears.
+      # 0.2.0 exists only because it was dispatched by hand.
+      #
+      # release-please *does* commit `.release-please-manifest.json` in its
+      # release PR, so on the merge of that PR the version is already sitting in
+      # the tree of a main push this workflow does see. Reading it here makes the
+      # released image independent of the tag push, and needs no PAT to arrange.
+      #
+      # The gate is "did this push change the manifest", not "is it a release
+      # commit" — a merge that leaves the manifest alone is not a release, and
+      # without the gate it would re-tag the current version with new code.
+      - name: Resolve tags
+        id: tags
+        run: |
+          set -euo pipefail
+          {
+            echo 'type=semver,pattern={{version}}'
+            echo 'type=ref,event=branch'
+            echo 'type=sha,format=long'
+            echo 'type=raw,value=latest'
+          } > tags.txt
+          version=''
+          if ! git diff --quiet HEAD^ HEAD -- .release-please-manifest.json; then
+            version=$(jq -er '.["."]' .release-please-manifest.json)
+            echo "type=raw,value=$version" >> tags.txt
+          fi
+          {
+            echo 'tags<<EOF'
+            cat tags.txt
+            echo 'EOF'
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # On main:      main, sha-<full>, latest
-          # On tag v0.1.1: 0.1.1, sha-<full>, latest
+          # On a push that is not a release: main, sha-<full>, latest
+          # On a push that changed the manifest:  the above plus 0.3.0
+          # On a tag push:                      the above plus 0.3.0 from semver
           #
-          # The bare `{{version}}` form is the one Renovate bumps cleanly in
-          # the meshcore compose file. The Dockerfile owns
+          # The bare version is the one Renovate bumps cleanly in the meshcore
+          # compose file. It is declared twice on purpose: `type=semver` covers a
+          # tag push, `type=raw` covers the main push, and metadata-action
+          # deduplicates the overlap. The Dockerfile owns
           # org.opencontainers.image.source, so it is not repeated here.
-          tags: |
-            type=semver,pattern={{version}}
-            type=ref,event=branch
-            type=sha,format=long
-            type=raw,value=latest
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
-            org.opencontainers.image.version={{version}}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
             org.opencontainers.image.revision={{sha}}
             org.opencontainers.image.created={{timestamp}}
 

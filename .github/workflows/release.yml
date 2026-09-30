@@ -2,8 +2,9 @@ name: Release
 
 # Decides the next version from the commit messages and opens a pull request
 # that does it. It never releases on its own: merging the release PR is what
-# creates the tag, the GitHub Release, and — via the tag push — the versioned
-# image in ci.yml.
+# creates the tag, the GitHub Release, and — via the manifest this PR commits —
+# the versioned image in ci.yml. The tag push itself does not reach ci.yml;
+# see the "Resolve tags" step there.
 #
 # Commit message to version, for the whole range since the last release:
 #

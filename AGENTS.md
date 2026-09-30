@@ -62,9 +62,41 @@ Two repos, two triggers. This one publishes an image; it is never built by
 
 ```
 feat:/fix: → main   →  CI          →  ghcr.io/…/meshbot-rs:latest
-merge release PR     →  tag v0.1.1  →  CI  →  …/meshbot-rs:0.1.1  ← Renovate pins this
+merge release PR     →  CI          →  …/meshbot-rs:0.3.0  ← Renovate pins this
 push meshcore         →  Komodo     →  host pulls the pinned image
 ```
+
+Note the second line: the released image is built by the **main push** that
+merges the release PR, not by the tag push. That is deliberate, and it is the
+opposite of what `on: push: tags` suggests.
+
+**Why: the tag push never fires.** GitHub does not start workflow runs for
+events created by `GITHUB_TOKEN`, and release-please creates its tag with
+exactly that token. So `on: push: tags: ["v*"]` is dead code, `latest` and
+`sha-<full>` move, the release *looks* like it worked, and the bare version the
+host pins never appears. `0.2.0` is the proof: the release merged at 15:39 and
+published only `main`/`latest`/`sha-…`; the `0.2.0` image appeared at 15:48
+from a manual `gh workflow run ci.yml --ref v0.2.0`.
+
+The fix is not a PAT — it is to stop depending on the tag push.
+release-please *commits* `.release-please-manifest.json` in its release PR, so
+the version is already in the tree of a main push that CI does see. The
+"Resolve tags" step in `ci.yml` reads it and emits `type=raw,value=<version>`,
+gated on that push having changed the manifest — ungated, every later merge
+would re-tag the current version with newer code. No credential, nothing to
+expire, and `type=semver` is kept so a hand-dispatched tag run still works.
+
+**If you ever see a release with no versioned image**, look for a `push` run on
+`main` whose commit changed the manifest. If that run is missing or red, the
+`checks` job is what stopped it; rebuild the tag by hand:
+
+```bash
+gh workflow run ci.yml --ref v0.3.0
+```
+
+`workflow_dispatch` is already a trigger, and `type=semver` finds the version
+on the ref, so this produces the missing tag from the tagged commit. Do **not**
+work around it by pinning the host to `latest`: that moves on every merge.
 - `meshcore/compose.yaml` pins a **tag**; there is no `build:` anywhere.
 - Runtime config is **host-owned**, mounted read-only from
   `/data/meshcore/meshbot-rs/{config.yaml,.env}`. Editing config and restarting
@@ -84,10 +116,16 @@ jobs in `ci.yml`:
 | `checks` | every push and PR | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
 | `image` | pushes to `main` and to `v*` tags | buildx build, push to GHCR, gated on `checks` |
 
-Image tags, from `docker/metadata-action`: on `main` → `main`, `sha-<full>`,
-`latest`; on a `v*` tag → the bare version (`0.1.1`), `sha-<full>`, `latest`. The
-bare form is the one Renovate bumps cleanly in compose. If compose pins `v0.1.1`
-instead, add `type=semver,pattern=v{{version}}` to the tag list.
+Image tags: a push that is not a release → `main`, `sha-<full>`, `latest`; a
+push that changed `.release-please-manifest.json` → those plus the bare version
+(`0.3.0`); a `v*` tag push → the same via `type=semver`. The bare form is the
+one Renovate bumps cleanly in compose. If compose pins `v0.3.0` instead, add
+`type=semver,pattern=v{{version}}` to the tag list.
+
+Because the tag push does not fire, the bare version arrives via the manifest
+read described under [Deployment model](#deployment-model). The `image` job
+therefore checks out with `fetch-depth: 0`; the default depth of 1 leaves no
+`HEAD^` for the comparison.
 
 **`checks` is deliberately unconditional**, including on tag pushes. A `needs:`
 on a conditionally-skipped job skips its dependents, so making `checks`
@@ -104,10 +142,10 @@ Version comes from the commit messages, via release-please:
 Two consequences worth knowing before editing the workflows:
 
 - **release-please never releases on its own.** It opens or updates a release
-  PR; merging *that* is what creates the tag, the GitHub Release, and the
-  versioned image. A `chore:` merge therefore queues a release PR with an empty
-  changelog body — that is intended, not a bug. Do not merge it unless you want
-  the version to move.
+  PR; merging *that* is what creates the tag, the GitHub Release, and — via the
+  manifest it commits — the versioned image. A `chore:` merge therefore queues a
+  release PR with an empty changelog body — that is intended, not a bug. Do not
+  merge it unless you want the version to move.
 - **The `commitlint` job is the only thing stopping a non-conventional title
   from merging.** A squash-merge title that is not a Conventional Commit is
   dropped by release-please's commit splitter, so that work would move no
@@ -157,6 +195,12 @@ Actions cannot change that. Until it is set to Public in the package settings,
 `org.opencontainers.image.source` label in the Dockerfile is what links the
 package to this repository, which is what lets the workflow keep pushing to it
 on later runs; it grants permission inheritance, not visibility.
+
+Only the web UI changes visibility — there is no supported REST endpoint for
+it, and it is **one-way**: a public package cannot be made private again. The
+flip can take a few minutes to propagate, and until it does an anonymous pull
+answers `404`, not `401` — a `404` means "not visible", so do not read it as a
+wrong package name without also checking the registry.
 
 ### ping needs a capability
 Docker grants neither `CAP_NET_RAW` nor a widened `ping_group_range`, so without
