@@ -42,6 +42,13 @@ jobs:
       pull-requests: read
     steps:
       - uses: amannn/action-semantic-pull-request@v6
+        env:
+          # v6 dropped the `token:` input, so the action reads the token from the
+          # environment instead. Without this it fails at startup with
+          # "Parameter token or opts.auth is required", before validating
+          # anything. `pull-requests: read` above scopes the token's abilities;
+          # it does not put one in `env`.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           # Listed explicitly rather than left to the action's default, so that
           # adding a type here is a deliberate act.
@@ -58,10 +65,14 @@ jobs:
             ci
             chore
           requireScope: false
-          # GitHub suggests the single commit message as the squash title, and
-          # it is easy to accept that by accident. The squash title is what
-          # release-please reads, so both have to be conventional.
-          validateSingleCommit: true
+          # The PR *title* is still checked, and that is the part that matters:
+          # a squash-merge title becomes the main-branch commit message, and
+          # release-please reads nothing else. Single-commit validation is off
+          # because release-please's own release PRs carry two commits by
+          # design (the release bump plus whatever landed since the last tag),
+          # and enforcing it would make this job reject the very PRs it exists
+          # to protect.
+          validateSingleCommit: false
 
   checks:
     name: fmt, clippy, test
