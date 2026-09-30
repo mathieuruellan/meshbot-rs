@@ -148,12 +148,28 @@ verbs:
     channel: "#admin"
     # No `get`: there is nothing to report, so a bare `reboot` answers with the
     # word list instead of running anything.
+    #
+    # One entry per machine, because the mapping lives HERE and not in the
+    # script: `words` is what goes on the air, `args` is what the script is told
+    # the word means. The script is then the same file on every install and never
+    # has to be edited for a deployment.
+    #
+    # The word is free-form. `alpha`, `myPersonalServer` and `nas-01` are all
+    # fine, and they are the only thing a message can supply: `args` is
+    # operator-declared, so no message can steer at a machine that is not one of
+    # these entries.
+    #
+    # The ids below are PLACEHOLDERS. This repository is public, so publishing
+    # which host is which vmid on which hypervisor type is reconnaissance. Put
+    # the real map in config.yaml, which is gitignored.
+    #
+    # `pve` is the node itself: `-` for the vmid, because the node endpoint has
+    # no vmid segment, and PVE_TOKEN_HOST because the guest token does not carry
+    # Sys.PowerMgmt.
     args:
-      - words: [alpha, beta, gamma, delta, komodo, pve]
+      - words: [alpha]
         script: pve-reboot.sh
-        # The script owns the word -> vmid/kind mapping. meshbot-rs never learns
-        # what a machine is, so the mapping can change without touching config.
-        args: ["{{target}}"]
+        args: ["{{target}}", "100", "qemu"]
         # An explicit allowlist: the subprocess must not inherit the bot's
         # environment, or the channel secret and every other token land in
         # every script.
@@ -162,10 +178,50 @@ verbs:
         # child's environment is emptied, so a variable this list omits is
         # invisible to the script — which would pin the dry-run guard on and
         # leave `reboot` permanently inert. Unset is a hard error naming the
-        # variable; `0` is a dry run; `1` reboots.
+        # variable; `0` is a dry run; `1` reboots. One switch arms every word.
         env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
         mutating: true
         # A reboot is disruptive and not idempotent, and the reply travels after
         # the machine is already going down. Worth the extra message.
+        confirm: true
+        reply: "{{stdout}}"
+
+      - words: [beta]
+        script: pve-reboot.sh
+        args: ["{{target}}", "101", "qemu"]
+        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+        mutating: true
+        confirm: true
+        reply: "{{stdout}}"
+
+      - words: [gamma]
+        script: pve-reboot.sh
+        args: ["{{target}}", "102", "lxc"]
+        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+        mutating: true
+        confirm: true
+        reply: "{{stdout}}"
+
+      - words: [delta]
+        script: pve-reboot.sh
+        args: ["{{target}}", "103", "qemu"]
+        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+        mutating: true
+        confirm: true
+        reply: "{{stdout}}"
+
+      - words: [komodo]
+        script: pve-reboot.sh
+        args: ["{{target}}", "104", "lxc"]
+        env: [PVE_URL, PVE_NODE, PVE_TOKEN_GUEST, PVE_ALLOW_REBOOT]
+        mutating: true
+        confirm: true
+        reply: "{{stdout}}"
+
+      - words: [pve]
+        script: pve-reboot.sh
+        args: ["{{target}}", "-", "host"]
+        env: [PVE_URL, PVE_NODE, PVE_TOKEN_HOST, PVE_ALLOW_REBOOT]
+        mutating: true
         confirm: true
         reply: "{{stdout}}"

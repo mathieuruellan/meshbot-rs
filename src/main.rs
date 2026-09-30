@@ -637,6 +637,7 @@ mod tests {
             // A partial result from a script that then failed. Broadcasting this
             // would report a half-finished reboot as done.
             stdout: "rebooting\n".into(),
+            stderr: String::new(),
             success: false,
             // No spawn error: the script ran and exited non-zero, which is a
             // different thing from having failed to start.
@@ -655,6 +656,7 @@ mod tests {
         };
         let outcome = script::Outcome {
             stdout: String::new(),
+            stderr: String::new(),
             success: false,
             error: Some("script \"missing.sh\" not found in /data".into()),
         };
@@ -674,6 +676,7 @@ mod tests {
         };
         let outcome = script::Outcome {
             stdout: "called cover.open_cover, http 200".into(),
+            stderr: String::new(),
             success: true,
             error: None,
         };
@@ -694,6 +697,7 @@ mod tests {
         };
         let outcome = script::Outcome {
             stdout: "armed".into(),
+            stderr: String::new(),
             success: true,
             error: None,
         };
@@ -715,6 +719,7 @@ mod tests {
         };
         let outcome = script::Outcome {
             stdout: String::new(),
+            stderr: String::new(),
             success: true,
             error: None,
         };
@@ -732,6 +737,7 @@ mod tests {
         };
         let outcome = script::Outcome {
             stdout: "x".repeat(400),
+            stderr: String::new(),
             success: true,
             error: None,
         };

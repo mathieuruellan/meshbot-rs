@@ -27,7 +27,7 @@ described below — check `src/`.
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 91 unit tests, no radio needed
+cargo test          # 99 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
@@ -150,8 +150,9 @@ Recorded so implementation doesn't relitigate them.
   `\n`, `\r`, `\t`, and input over 64 **bytes**. Typed slot values: int, float,
   bool, quoted string, word. Words exclude `/` to block traversal, and also `=`
   and quotes so a second slot can't hide inside a word. **IPv4 was dropped**: once
-  host mapping moved into the scripts, a message-supplied address would only
-  reintroduce the target-selection hole the enum removes.
+  host mapping became table data rather than something a message could reach, a
+  message-supplied address would only reintroduce the target-selection hole the
+  enum removes.
 - **Context** is a **flat key/value map**, not a struct: `verb`, the declared
   enum word as `target`, message slots, `channel`, `channel_idx`, `snr`,
   `sender_timestamp`, `.env` keys, and `status`.
@@ -185,17 +186,28 @@ Recorded so implementation doesn't relitigate them.
   template value cannot become command injection. The subprocess gets an
   explicit `env` allowlist and must not inherit the bot's environment, or the
   channel secret lands in every script. `mutating: true` marks a state change;
-  `confirm: true` additionally requires the latch. Script **stderr is never
-  relayed** and stdout is clamped to one frame. `DELETE`-style "no retries"
-  reasoning still applies: no action retries, mesh airtime is scarce.
-- **Host/VM mapping is the script's job.** meshbot-rs never learns that
-  `alpha` is VM 100 or that it is a QEMU guest rather than an LXC container.
-  That mapping is private to the script and can change without a config edit.
-  For PVE that means the API call is chosen per kind: `.../qemu/{vmid}/status/
-  reboot`, `.../lxc/{vmid}/status/reboot`, or `.../status/reboot` for the host
-  itself. Guests use a `VM.PowerMgmt` token; the host needs `Sys.PowerMgmt` and
-  a second token, which is deferred — so `reboot pve` is declared but not
-  wired.
+  `confirm: true` additionally requires the latch. stdout is clamped to one
+  frame; **a failed action's last line of stderr is relayed**, so both streams
+  are public and neither may carry a token, an id or a URL. `DELETE`-style "no
+  retries" reasoning still applies: no action retries, mesh airtime is scarce.
+- **The host map is the verb table's job, and a script arg is literal.** The
+  mapping is declared per enum word as literals: `reboot myServer` runs
+  `pve-reboot.sh myServer 112 qemu`. This is the reverse of the earlier design,
+  where `map_word` lived in the script — reversed so one tracked script works on
+  every install with no per-deployment edit. A literal is still operator-declared
+  and unreachable from a message: the grammar has no way to express one, so the
+  enum still does the work and `reboot somethingElse` fires nothing. The
+  literals are placeholders in the tracked config because the repo is public; the
+  real map goes in the gitignored `config.yaml` — once the loader lands, since
+  `default_verbs()` is compiled in until then.
+- **The kind picks both the API path and the token**, which is why it travels as
+  an argument: `.../qemu/{vmid}/status/reboot`, `.../lxc/{vmid}/status/reboot`,
+  or `.../status/reboot` for the node itself, which has no vmid segment and takes
+  `-`. Guests use a `VM.PowerMgmt` token; the node needs `Sys.PowerMgmt` and a
+  second token (`PVE_TOKEN_HOST`), so each word's entry names the token it needs.
+  One `PVE_ALLOW_REBOOT` arms all of them, guests and hypervisor alike. meshbot
+  still never learns what `alpha` *is* — only which id and kind the operator
+  filed under that word.
 - **Confirmation latch**: 30 seconds, single use, only for `reboot`. `garage`
   and `alarm` are idempotent on a private channel, so a second message buys
   nothing. The latch keys on the **canonical** command, so `reboot alpha` and

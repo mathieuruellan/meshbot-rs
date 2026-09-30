@@ -23,7 +23,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::parse::Context as Message;
 use crate::verbs::{ActionSpec, MAX_REPLY_BYTES};
@@ -90,6 +92,11 @@ pub fn resolve_script(name: &str, dir: &Path) -> Result<PathBuf> {
 pub struct Outcome {
     /// Clamped stdout, destined for the air.
     pub stdout: String,
+    /// Clamped stderr, destined for the air **only when the action failed** —
+    /// see [`Outcome::failure_line`]. A script therefore has to keep both
+    /// streams safe to broadcast: a token, a host id or a URL on stderr is a
+    /// leak the moment the action exits non-zero.
+    pub stderr: String,
     pub success: bool,
     /// Set when the script could not be run at all. Never sent verbatim if it
     /// might carry a path; the caller decides what to put on the air.
@@ -100,13 +107,39 @@ impl Outcome {
     /// A short line describing failure, safe to put on a channel: it never
     /// includes a token, and a path from a rejected script name is not useful
     /// over LoRa anyway.
+    ///
+    /// The script's own last stderr line is preferred over any generic string,
+    /// because "action did not succeed" tells an operator nothing about a
+    /// command they asked for by name. `stderr` is the script's words, so this
+    /// is only as safe as the script is — hence the contract that both streams
+    /// stay free of credentials, ids and URLs.
     pub fn failure_line(&self) -> String {
-        match &self.error {
-            Some(_) => "action failed".to_string(),
-            None if !self.success => "action did not succeed".to_string(),
-            None => self.stdout.clone(),
+        if self.success {
+            return self.stdout.clone();
         }
+        last_line(&self.stderr).unwrap_or_else(|| match &self.error {
+            Some(_) => "action failed".to_string(),
+            None => "action did not succeed".to_string(),
+        })
     }
+}
+
+/// Longest a script's stderr may occupy in a reply, so a chatty failure cannot
+/// eat the whole frame the failure needs.
+const MAX_STDERR_BYTES: usize = 100;
+
+/// The last non-empty line of a script's stderr, trimmed and clamped.
+///
+/// A script is free to write several lines of diagnostics; only the last is
+/// kept, because that is the one that names the failure. Earlier lines are
+/// progress or noise, and the frame is scarce.
+fn last_line(stderr: &str) -> Option<String> {
+    let line = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(crate::verbs::clamp(line, MAX_STDERR_BYTES))
 }
 
 /// Expand `{{slot}}` against the message context.
@@ -198,6 +231,7 @@ pub async fn run(action: &ActionSpec, ctx: &Message, dir: &Path) -> Outcome {
             tracing::warn!(script = %action.script, %err, "action not runnable");
             return Outcome {
                 stdout: String::new(),
+                stderr: String::new(),
                 success: false,
                 error: Some(err.to_string()),
             };
@@ -215,62 +249,131 @@ pub async fn run(action: &ActionSpec, ctx: &Message, dir: &Path) -> Outcome {
     }
     child.stdin(Stdio::null());
     child.stdout(Stdio::piped());
-    // stderr is never relayed onto a channel. Nulled rather than inherited so a
-    // chatty script cannot interleave into the bot's logs, and piped-then-ignored
-    // would risk filling a pipe buffer and blocking the child.
-    child.stderr(Stdio::null());
-    // Without this, the timeout below is a lie: `wait_with_output` consumes the
-    // child, so dropping the future on expiry drops the `Child` and — with
-    // tokio's default of `kill_on_drop(false)` — leaves the script running with
-    // nobody waiting for it. A `reboot` loop would outlive its timeout.
+    // Piped rather than nulled: a failing action's last stderr line becomes the
+    // reply, which is the only diagnostic an operator asking for a reboot by
+    // name ever sees. Both pipes are drained by tasks below, so a chatty script
+    // cannot fill a buffer and block, and its output cannot interleave into the
+    // bot's own logs. On success stderr is logged and not sent.
+    child.stderr(Stdio::piped());
+    // The child is killed explicitly on timeout. `kill_on_drop` stays on as a
+    // backstop for the paths that return early, so no future can leave a script
+    // running past its deadline.
     child.kill_on_drop(true);
 
-    let child = match child.spawn() {
+    let mut child = match child.spawn() {
         Ok(child) => child,
         Err(err) => {
             tracing::warn!(script = %script.display(), %err, "spawn failed");
             return Outcome {
                 stdout: String::new(),
+                stderr: String::new(),
                 success: false,
                 error: Some(err.to_string()),
             };
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Err(_) => Outcome {
-            stdout: String::new(),
-            success: false,
-            error: Some(format!("timed out after {}s", timeout.as_secs())),
-        },
+    // Take the pipes before waiting. `wait_with_output` would consume the child
+    // and return everything at once, but it also means a timeout drops the
+    // future and the output with it — and a timeout is exactly when the
+    // diagnosis is worth having. Draining in tasks instead keeps whatever the
+    // script managed to write before it was killed.
+    let out_task = child.stdout.take().map(|pipe| tokio::spawn(drain(pipe)));
+    let err_task = child.stderr.take().map(|pipe| tokio::spawn(drain(pipe)));
+
+    // `status` is the exit status when the script finished; `error` is why it
+    // did not, when it did not. The two are separate because a timeout is a
+    // reportable fact of its own rather than a missing result.
+    let (status, error) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => (Some(status), None),
         Ok(Err(err)) => {
             tracing::warn!(script = %script.display(), %err, "wait failed");
-            Outcome {
-                stdout: String::new(),
-                success: false,
-                error: Some(err.to_string()),
+            (None, Some(err.to_string()))
+        }
+        Err(_) => {
+            // `child` is still owned here, so the kill is explicit and the exit
+            // status is reaped rather than left as a zombie.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            (
+                None,
+                Some(format!("timed out after {}s", timeout.as_secs())),
+            )
+        }
+    };
+
+    let stdout = join(out_task).await;
+    let stderr = join(err_task).await;
+
+    let Some(status) = status else {
+        // Killed or interrupted. Whatever it wrote before that is still the
+        // most useful thing on the air, so it is kept even though the run
+        // itself produced no result.
+        return Outcome {
+            stdout: String::new(),
+            stderr: crate::verbs::clamp(&stderr, MAX_STDERR_BYTES),
+            success: false,
+            error,
+        };
+    };
+
+    // A script may print far more than one frame. Clamp before the
+    // template sees it, so `{{stdout}}` can never build an over-long
+    // reply that hangs the radio.
+    let stdout = crate::verbs::clamp(&stdout, MAX_REPLY_BYTES);
+    let stderr = crate::verbs::clamp(&stderr, MAX_STDERR_BYTES);
+    let success = status.success();
+
+    if success {
+        // Logged, never relayed: a dry run explains itself on stderr and that
+        // explanation must stay off the channel.
+        if !stderr.is_empty() {
+            tracing::debug!(script = %script.display(), %stderr, "stderr on success");
+        }
+    } else {
+        tracing::warn!(
+            script = %script.display(),
+            code = status.code(),
+            %stderr,
+            "action exited non-zero"
+        );
+    }
+
+    Outcome {
+        stdout,
+        stderr,
+        success,
+        error: None,
+    }
+}
+
+/// Read a child's pipe to EOF, keeping only the first 4 KB.
+///
+/// The rest is still drained — a script that prints megabytes must not block
+/// forever on a full pipe — but it is discarded rather than buffered, so a
+/// runaway script cannot grow this process's memory.
+async fn drain<R: AsyncRead + Unpin>(mut pipe: R) -> String {
+    const MAX_CAPTURE_BYTES: usize = 4096;
+
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = MAX_CAPTURE_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
             }
         }
-        Ok(Ok(output)) => {
-            // A script may print far more than one frame. Clamp before the
-            // template sees it, so `{{stdout}}` can never build an over-long
-            // reply that hangs the radio.
-            let stdout =
-                crate::verbs::clamp(&String::from_utf8_lossy(&output.stdout), MAX_REPLY_BYTES);
-            let success = output.status.success();
-            if !success {
-                tracing::warn!(
-                    script = %script.display(),
-                    code = output.status.code(),
-                    "action exited non-zero"
-                );
-            }
-            Outcome {
-                stdout,
-                success,
-                error: None,
-            }
-        }
+    }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Wait for a drain task, falling back to empty output if it panicked.
+async fn join(task: Option<JoinHandle<String>>) -> String {
+    match task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
     }
 }
 
@@ -401,6 +504,61 @@ mod tests {
         assert_eq!(args, vec!["a; rm -rf / b".to_string()]);
     }
 
+    /// End to end, through the real table: a typed word becomes exactly the
+    /// argv the script expects, with the id and kind coming from the table and
+    /// never from the message.
+    ///
+    /// This is the whole reason the map moved out of the script, so it is worth
+    /// pinning at this level rather than in the table's own test: what matters is
+    /// the command line a person on a channel can cause.
+    #[test]
+    fn each_declared_word_produces_the_command_its_entry_declares() {
+        let dir = sandbox("reboot-argv");
+        write_script(&dir, "pve-reboot.sh", "#!/bin/sh\nexit 0\n");
+        let table = crate::verbs::default_verbs();
+        let reboot = table.get("reboot").expect("reboot is declared");
+
+        let expected = [
+            ("alpha", vec!["alpha", "100", "qemu"]),
+            ("beta", vec!["beta", "101", "qemu"]),
+            ("gamma", vec!["gamma", "102", "lxc"]),
+            ("delta", vec!["delta", "103", "qemu"]),
+            ("komodo", vec!["komodo", "104", "lxc"]),
+            // The node: no vmid segment in the API path, and no id on the air.
+            ("pve", vec!["pve", "-", "host"]),
+        ];
+
+        for (word, argv) in expected {
+            let ctx = parse::parse(&format!("reboot {word}")).unwrap();
+            let action = &reboot
+                .args
+                .iter()
+                .find(|arg| arg.words.iter().any(|w| w == word))
+                .unwrap_or_else(|| panic!("{word} is not declared"))
+                .action;
+            // The env allowlist is emptied for this assertion: `command_for`
+            // reads it from the test process's own environment, and no test
+            // should mutate that. What is under test here is the argv.
+            let action = ActionSpec {
+                env: vec![],
+                ..action.clone()
+            };
+            let (script, args, _) = command_for(&action, &ctx, &dir).unwrap();
+            assert_eq!(args, argv, "{word}");
+            assert_eq!(script.file_name().unwrap(), "pve-reboot.sh");
+        }
+    }
+
+    /// A word the table does not declare resolves to no action at all, so there
+    /// is nothing to build a command from. This is the enum doing its job: the
+    /// message can pick a machine, never invent one.
+    #[test]
+    fn an_undeclared_word_fires_nothing() {
+        let table = crate::verbs::default_verbs();
+        let ctx = parse::parse("reboot myPersonalServer").unwrap();
+        assert!(!table.resolve(&ctx).is_actionable());
+    }
+
     #[test]
     fn the_child_gets_only_the_allowlisted_variables() {
         // A fake parent environment holding a secret the action never declares.
@@ -441,14 +599,20 @@ mod tests {
         assert_eq!(outcome.stdout, "armed\n");
     }
 
+    /// A failing action answers with the script's own last line of stderr.
+    ///
+    /// This replaced the old rule, where stderr was discarded and every failure
+    /// read `action did not succeed`. That told an operator nothing about a command
+    /// they asked for by name. The rule is still fail-closed in the way that
+    /// matters: a failed run never renders its stdout, so a partial result is never
+    /// broadcast as if it were the outcome.
     #[tokio::test]
-    async fn a_failing_script_does_not_succeed_and_never_leaks_stderr() {
+    async fn a_failing_script_replies_with_its_last_stderr_line() {
         let dir = sandbox("fail");
-        // The secret goes to stderr, which must not reach the reply.
         write_script(
             &dir,
             "boom.sh",
-            "#!/bin/sh\necho token=SECRET >&2\nexit 3\n",
+            "#!/bin/sh\necho 'looking up the task' >&2\necho 'guest 112 is locked' >&2\nexit 3\n",
         );
 
         let ctx = parse::parse("alarm arm").unwrap();
@@ -458,8 +622,124 @@ mod tests {
         };
         let outcome = run(&action, &ctx, &dir).await;
         assert!(!outcome.success);
-        assert!(!outcome.stdout.contains("SECRET"), "stderr leaked");
-        assert!(!outcome.failure_line().contains("SECRET"));
+        assert!(
+            !outcome.failure_line().contains("looking up"),
+            "only the last line is sent"
+        );
+        assert_eq!(outcome.failure_line(), "guest 112 is locked");
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_nothing_on_stderr_stays_generic() {
+        let dir = sandbox("silent-fail");
+        write_script(&dir, "quiet-fail.sh", "#!/bin/sh\nexit 3\n");
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "quiet-fail.sh".into(),
+            ..ActionSpec::default()
+        };
+        assert_eq!(
+            run(&action, &ctx, &dir).await.failure_line(),
+            "action did not succeed"
+        );
+    }
+
+    /// The reason for draining the pipes by hand rather than with
+    /// `wait_with_output`: a timeout used to discard the output along with the
+    /// future, which is exactly when a diagnosis is worth having.
+    #[tokio::test]
+    async fn a_script_killed_at_the_timeout_still_explains_itself() {
+        let dir = sandbox("slow-fail");
+        write_script(
+            &dir,
+            "slow-fail.sh",
+            "#!/bin/sh\necho 'still polling the task' >&2\nsleep 30\n",
+        );
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "slow-fail.sh".into(),
+            timeout_secs: Some(1),
+            ..ActionSpec::default()
+        };
+        let outcome = run(&action, &ctx, &dir).await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.failure_line(), "still polling the task");
+        let error = outcome.error.unwrap_or_default();
+        assert!(error.contains("timed out"), "{error:?}");
+    }
+
+    /// A script that succeeds may be as chatty as it likes on stderr: the detail
+    /// stays in the log. `pve-reboot.sh`'s dry run depends on this — it prints the
+    /// request it would have sent, which must never reach a channel.
+    #[tokio::test]
+    async fn a_successful_scripts_stderr_stays_off_the_air() {
+        let dir = sandbox("chatty-ok");
+        write_script(
+            &dir,
+            "chatty-ok.sh",
+            "#!/bin/sh\necho 'would POST https://pve.example/api2/json/nodes/pve/qemu/112' >&2\necho 'dry-run: nothing sent'\nexit 0\n",
+        );
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "chatty-ok.sh".into(),
+            reply: "{{stdout}}".into(),
+            ..ActionSpec::default()
+        };
+        let outcome = run(&action, &ctx, &dir).await;
+        assert!(outcome.success);
+        assert_eq!(outcome.stdout, "dry-run: nothing sent\n");
+        assert!(outcome.stderr.contains("would POST"));
+        // What the caller puts on the air is the success path, so it is stdout.
+        assert!(!outcome.stdout.contains("pve.example"));
+    }
+
+    /// A chatty failure cannot eat the frame the failure needs.
+    #[tokio::test]
+    async fn a_relayed_stderr_line_is_clamped() {
+        let dir = sandbox("loud-fail");
+        write_script(
+            &dir,
+            "loud-fail.sh",
+            &format!("#!/bin/sh\necho 'b {} c' >&2\nexit 3\n", "x".repeat(400)),
+        );
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "loud-fail.sh".into(),
+            ..ActionSpec::default()
+        };
+        let reply = run(&action, &ctx, &dir).await.failure_line();
+        assert!(
+            reply.len() <= MAX_STDERR_BYTES,
+            "{} bytes: {reply}",
+            reply.len()
+        );
+        assert!(reply.starts_with("b xxx"));
+    }
+
+    /// A script that prints more than the capture limit is drained rather than
+    /// allowed to fill its pipe and deadlock, and what is kept is the beginning.
+    #[tokio::test]
+    async fn a_script_that_floods_stderr_does_not_deadlock() {
+        let dir = sandbox("flood");
+        write_script(
+            &dir,
+            "flood.sh",
+            "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\nexit 3\n",
+        );
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "flood.sh".into(),
+            timeout_secs: Some(5),
+            ..ActionSpec::default()
+        };
+        let outcome = run(&action, &ctx, &dir).await;
+        assert!(!outcome.success);
+        assert!(outcome.stderr.len() <= MAX_STDERR_BYTES);
     }
 
     #[tokio::test]

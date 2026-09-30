@@ -26,6 +26,13 @@ pub struct ActionSpec {
     pub script: String,
     /// Argument templates, e.g. `{{target}}`. They expand only to values the
     /// verb table declares, never to free message text.
+    ///
+    /// An argument with no placeholder is a **literal**: it is handed to the
+    /// script exactly as written. That is how a declared enum word carries the
+    /// id and kind of what it names — the mapping is data in this table, not
+    /// code in the script, so the same script file runs unchanged on every
+    /// install. A literal is always operator-declared; the message only ever
+    /// picks which declared entry fires, so a literal can never be steered.
     pub args: Vec<String>,
     /// Names passed through from `.env`. An explicit allowlist: the subprocess
     /// must not inherit the bot's environment, or the channel secret and every
@@ -402,9 +409,27 @@ pub fn default_verbs() -> VerbTable {
         timeout_secs: Some(10),
     };
 
-    let reboot = ActionSpec {
+    // The word -> (vmid, kind, token) map is HERE, not in the script.
+    //
+    // Two reasons it moved out of `map_word`: the same script file then works
+    // unchanged on every install, with no per-deployment edit to a tracked
+    // template; and the kind selects the token, which is exactly the thing the
+    // script cannot decide for itself without learning what a guest id means.
+    //
+    // The ids below are PLACEHOLDERS — this repository is public, so publishing
+    // which host is which vmid on which hypervisor type is reconnaissance. The
+    // real map belongs in config.yaml, which is gitignored; it is not editable
+    // there yet because the config loader has not landed, so until it does this
+    // table is what the bot runs.
+    //
+    // `pve` is the node itself: `-` for the vmid, because /nodes/{node}/status/
+    // reboot has no vmid segment, and the host token because the guest token
+    // does not carry Sys.PowerMgmt.
+    let reboot = |vmid: &str, kind: &str, token: &str| ActionSpec {
         script: "pve-reboot.sh".into(),
-        args: vec!["{{target}}".into()],
+        // arg 0 is the declared word, not the message text: `{{target}}`
+        // resolves to `words[0]`. It is a label for the reply and nothing else.
+        args: vec!["{{target}}".into(), vmid.into(), kind.into()],
         // PVE_ALLOW_REBOOT has to be named here even though it is not a
         // credential. The child's environment is emptied, so a variable the
         // table does not declare is invisible to the script — which would leave
@@ -414,7 +439,7 @@ pub fn default_verbs() -> VerbTable {
         env: vec![
             "PVE_URL".into(),
             "PVE_NODE".into(),
-            "PVE_TOKEN_GUEST".into(),
+            token.into(),
             "PVE_ALLOW_REBOOT".into(),
         ],
         mutating: true,
@@ -422,6 +447,17 @@ pub fn default_verbs() -> VerbTable {
         reply: "{{stdout}}".into(),
         timeout_secs: Some(10),
     };
+
+    // Declaration order is the order `help reboot` and the "which word?" reply
+    // list them, and `primary_word` takes the first.
+    let reboot_targets: [(&str, &str, &str, &str); 6] = [
+        ("alpha", "100", "qemu", "PVE_TOKEN_GUEST"),
+        ("beta", "101", "qemu", "PVE_TOKEN_GUEST"),
+        ("gamma", "102", "lxc", "PVE_TOKEN_GUEST"),
+        ("delta", "103", "qemu", "PVE_TOKEN_GUEST"),
+        ("komodo", "104", "lxc", "PVE_TOKEN_GUEST"),
+        ("pve", "-", "host", "PVE_TOKEN_HOST"),
+    ];
 
     VerbTable::new(vec![
         VerbSpec {
@@ -503,17 +539,13 @@ pub fn default_verbs() -> VerbTable {
             desc: "restart a machine".into(),
             channel: Some(ADMIN.into()),
             get: None,
-            args: vec![ArgSpec {
-                words: vec![
-                    "alpha".into(),
-                    "beta".into(),
-                    "gamma".into(),
-                    "delta".into(),
-                    "komodo".into(),
-                    "pve".into(),
-                ],
-                action: reboot,
-            }],
+            args: reboot_targets
+                .iter()
+                .map(|(word, vmid, kind, token)| ArgSpec {
+                    words: vec![(*word).into()],
+                    action: reboot(vmid, kind, token),
+                })
+                .collect(),
         },
     ])
 }
@@ -676,11 +708,16 @@ mod tests {
         }
     }
 
-    /// Every action names the script it runs, and every argument template is a
-    /// placeholder rather than a literal the message could have supplied. A
-    /// literal argument is how a real host id would end up in the verb table.
+    /// Every action names the script it runs, and no argument looks like a path.
+    ///
+    /// A literal argument is expected now — a declared word carries the id and kind
+    /// of what it names — and a literal is indistinguishable from an expanded slot
+    /// once the string exists, so parsing cannot tell the two apart and neither can
+    /// this test. What survives is the check that matters either way: no argument
+    /// contains a path separator or a quote, so nothing an action is handed could
+    /// name a file or open a quoted string if a script ever re-parsed its argv.
     #[test]
-    fn actions_only_take_declared_placeholders_as_arguments() {
+    fn no_action_argument_carries_a_path_or_a_quote() {
         let table = default_verbs();
         for verb in &table.verbs {
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
@@ -692,15 +729,63 @@ mod tests {
                     verb.name
                 );
                 for arg in &action.args {
-                    let is_slot = parse::parse(&format!("probe {arg}")).is_ok();
-                    let looks_like_a_path = arg.contains('/') || arg.contains('"');
                     assert!(
-                        is_slot || !looks_like_a_path,
+                        !arg.contains('/') && !arg.contains('"'),
                         "{}: argument {arg:?} looks like a supplied path",
                         verb.name
                     );
                 }
             }
+        }
+    }
+
+    /// `reboot` hands the script everything the script cannot know: which machine
+    /// the word means, and which token that machine needs.
+    ///
+    /// The two halves are separate failures. Passing the guest token where the host
+    /// one belongs is a 401 at best and an unhelpful one at worst; passing a literal
+    /// where `{{target}}` belongs would silently stop echoing the machine's name on
+    /// the air. So both are pinned here rather than left to review.
+    #[test]
+    fn reboot_declares_the_id_kind_and_token_of_each_word() {
+        let table = default_verbs();
+        let reboot = table.get("reboot").expect("reboot is declared");
+
+        for arg in &reboot.args {
+            let word = &arg.words[0];
+            let [target, vmid, kind] = arg.action.args.as_slice() else {
+                panic!("{word}: reboot takes <word> <vmid> <kind>");
+            };
+            assert_eq!(target, "{{target}}", "{word}: arg 0 must be the word");
+            assert!(
+                matches!(kind.as_str(), "qemu" | "lxc" | "host"),
+                "{word}: unknown kind {kind:?}"
+            );
+            match kind.as_str() {
+                "host" => assert_eq!(vmid, "-", "{word}: the node endpoint has no vmid"),
+                _ => assert!(
+                    vmid.chars().all(|c| c.is_ascii_digit()) && vmid.len() >= 3,
+                    "{word}: guest id must be numeric"
+                ),
+            }
+
+            let tokens: Vec<&String> = arg
+                .action
+                .env
+                .iter()
+                .filter(|name| name.starts_with("PVE_TOKEN"))
+                .collect();
+            assert_eq!(tokens.len(), 1, "{word}: exactly one token");
+            let expected = if kind == "host" {
+                "PVE_TOKEN_HOST"
+            } else {
+                "PVE_TOKEN_GUEST"
+            };
+            assert_eq!(
+                tokens[0].as_str(),
+                expected,
+                "{word}: a {kind} must use {expected}"
+            );
         }
     }
 
