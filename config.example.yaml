@@ -155,11 +155,13 @@ verbs:
       reply: "{{stdout}}"
 
   - name: komodo
-    desc: "maintenance state"
+    desc: "unhealthy stacks and servers"
     channel: "#admin"
     get:
+      # One message per line of stdout, so a clean fleet answers once and a
+      # fleet in trouble answers once per problem, numbered i/n.
       script: komodo-status.sh
-      env: [KOMODO_URL, KOMODO_TOKEN]
+      env: [KOMODO_URL, KOMODO_KEY, KOMODO_SECRET]
       reply: "{{stdout}}"
 
   - name: reboot

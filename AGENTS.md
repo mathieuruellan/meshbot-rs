@@ -16,12 +16,13 @@ grammar (`src/meshbot.pest`), the flat context with reserved-key poisoning
 (`src/verbs.rs`), the script allowlist and executor (`src/script.rs`), the
 confirmation latch (`src/latch.rs`) and the on-air reply path (`decide` /
 `handle_message` / `send` in `src/main.rs`) are implemented and unit-tested.
-Messages that resolve to an action now run the declared script and put one reply
-on the air. The config loader (`src/config.rs`) is implemented too, so
-`config.example.yaml` is the real schema and is validated by the test suite; the
-verb table, the channel map and the script directory all come from
-`config.yaml`. It also owns the radio clock (`set_radio_clock`). Do not assume a
-feature exists because it is described below — check `src/`.
+Messages that resolve to an action now run the declared script and put its
+replies on the air — one message per line of the reply. The config loader
+(`src/config.rs`) is implemented too, so `config.example.yaml` is the real schema
+and is validated by the test suite; the verb table, the channel map and the script
+directory all come from `config.yaml`. It also owns the radio clock
+(`set_radio_clock`). Do not assume a feature exists because it is described
+below — check `src/`.
 
 ## Build
 ```bash
@@ -413,11 +414,18 @@ Recorded so implementation doesn't relitigate them.
   action result, `${ENV}` for environment. Unresolved placeholder ⇒ fail at
   config load, not at message time. There is deliberately no `{{text}}`: action
   arguments may only expand to values the verb table declares.
-- **Replies**: exactly one per inbound message, truncated to one frame, and *at
-  most* one — an action that renders to nothing sends nothing rather than a blank
-  frame. A failed action never renders its template, so a half-finished reboot is
-  never reported as done. `help` and `help <verb>` are built in and rendered from
-  the verb table, so a verb cannot be added without documenting it.
+- **Replies**: a successful action produces **one message per line** of its
+  rendered reply, each truncated to one frame, capped at `MAX_REPLIES` (4) plus a
+  `+N more` line — so a script listing eleven things never becomes eleven
+  transmissions. Blank lines are dropped, so an action that renders to nothing
+  sends nothing rather than a blank frame. A **failed** action is always exactly
+  one message: it never renders its template, so a half-finished reboot is never
+  reported as done. `help` and `help <verb>` are built in and rendered from the
+  verb table, so a verb cannot be added without documenting it.
+- **The stdout clamp is per line, not per blob.** It used to be applied to the
+  whole of stdout in `script::run`, which silently truncated a multi-line report
+  mid-list. `verbs::split_reply` applies it per line at the point of becoming
+  messages, so the executor hands the template the script's output intact.
 - **Channel scope is enforced in `decide()`**, before resolution, so it covers
   every outcome and not just the ones that spawn. A verb declared for one channel
   answers `not on this channel` on the other. `help` is not in the table and so
