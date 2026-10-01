@@ -18,6 +18,16 @@ use crate::parse::{CONFIRM_SUFFIX, Context, Value};
 /// character count.
 pub const MAX_REPLY_BYTES: usize = 150;
 
+/// How many messages one action's reply may become.
+///
+/// A script that reports several things — every unhealthy machine, say — puts one
+/// on each line of stdout, and each line is a separate transmission. Airtime on
+/// LoRa is shared with everything else on the channel, so the count is bounded
+/// rather than left to the script. The overflow is summarised instead of dropped:
+/// a truncated list that silently loses four entries is worse than a shorter list
+/// that says it is shorter.
+pub const MAX_REPLIES: usize = 4;
+
 /// What an action runs. A script, never a URL: the path is declared in config
 /// and resolved against an allowlist, and the message can only pick which
 /// declared entry fires.
@@ -343,6 +353,34 @@ pub fn clamp(s: &str, max: usize) -> String {
         return s[..space].to_string();
     }
     s[..end].trim_end().to_string()
+}
+
+/// One reply per line of a rendered template, clamped and capped.
+///
+/// A single line still produces a single reply, so every existing action behaves
+/// exactly as before: the templates in `scripts.example/` all end in one line and
+/// this function returns one message for them.
+///
+/// Empty lines are dropped rather than sent, which preserves the rule that an
+/// action rendering to nothing says nothing instead of putting a blank frame on
+/// the air. Each line is clamped on its own, so a long first line cannot eat the
+/// budget of the ones after it.
+pub fn split_reply(rendered: &str) -> Vec<String> {
+    let lines: Vec<String> = rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| clamp(line, MAX_REPLY_BYTES))
+        .collect();
+
+    if lines.len() <= MAX_REPLIES {
+        return lines;
+    }
+
+    let omitted = lines.len() - MAX_REPLIES;
+    let mut out = lines[..MAX_REPLIES].to_vec();
+    out.push(format!("+{omitted} more"));
+    out
 }
 
 /// Typo tolerance scales with length: one slip in `beta`, up to three in
@@ -731,6 +769,75 @@ mod tests {
     #[test]
     fn clamp_drops_a_whole_trailing_word_when_it_can() {
         assert_eq!(clamp("one two three", 9), "one two");
+    }
+
+    #[test]
+    fn a_single_line_still_produces_a_single_reply() {
+        assert_eq!(split_reply("all ok"), ["all ok"]);
+        // The trailing newline every `printf` leaves is not a second message.
+        assert_eq!(split_reply("armed\n"), ["armed"]);
+    }
+
+    #[test]
+    fn each_line_becomes_its_own_reply() {
+        assert_eq!(
+            split_reply("1/3 server a not ok\n2/3 stack b unhealthy\n3/3 stack c down"),
+            [
+                "1/3 server a not ok",
+                "2/3 stack b unhealthy",
+                "3/3 stack c down"
+            ]
+        );
+    }
+
+    /// Blank lines are dropped rather than sent: an action that renders to
+    /// nothing says nothing, instead of putting an empty frame on the air.
+    #[test]
+    fn empty_and_blank_input_produces_no_reply() {
+        assert!(split_reply("").is_empty());
+        assert!(split_reply("\n\n  \n").is_empty());
+        assert!(split_reply("real\n\n").len() == 1);
+    }
+
+    /// Each line gets its own budget, so a long first line cannot consume the
+    /// allowance of the ones after it.
+    #[test]
+    fn each_line_is_clamped_independently() {
+        let replies = split_reply(&format!("{}\nshort", "x".repeat(400)));
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(replies[0].len() <= MAX_REPLY_BYTES);
+        assert_eq!(replies[1], "short");
+    }
+
+    /// Airtime is shared with everything else on the channel, so the count is
+    /// bounded — and the overflow is stated rather than dropped, because a list
+    /// that silently loses four entries is worse than one that says it is short.
+    #[test]
+    fn a_long_list_is_capped_with_a_summary() {
+        let rendered = (1..=9)
+            .map(|i| format!("{i}/9 stack s{i} unhealthy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let replies = split_reply(&rendered);
+
+        assert_eq!(replies.len(), MAX_REPLIES + 1);
+        assert_eq!(replies[..MAX_REPLIES].len(), 4);
+        // The script's own denominators stay honest: the cap hides messages, not
+        // facts, so what is shown still says it came out of nine.
+        assert_eq!(replies[3], "4/9 stack s4 unhealthy");
+        assert_eq!(replies[4], "+5 more");
+    }
+
+    #[test]
+    fn exactly_the_cap_is_not_a_summary() {
+        let rendered = (1..=MAX_REPLIES)
+            .map(|i| format!("{i}/4 stack s{i} unhealthy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let replies = split_reply(&rendered);
+
+        assert_eq!(replies.len(), MAX_REPLIES);
+        assert_eq!(replies[3], "4/4 stack s4 unhealthy");
     }
 
     #[test]

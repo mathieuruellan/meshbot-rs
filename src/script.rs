@@ -28,7 +28,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::parse::Context as Message;
-use crate::verbs::{ActionSpec, MAX_REPLY_BYTES};
+use crate::verbs::ActionSpec;
 
 /// Longest a script may take before it is killed and the reply is a failure.
 /// A per-action `timeout_secs` overrides this.
@@ -73,7 +73,10 @@ pub fn resolve_script(name: &str, dir: &Path) -> Result<PathBuf> {
 /// What a script produced, and whether it succeeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// Clamped stdout, destined for the air.
+    /// stdout, destined for the air — **one message per line**, each clamped by
+    /// [`crate::verbs::split_reply`] rather than here. Clamping the whole blob
+    /// would truncate a script that reports several things mid-list, so the
+    /// budget is applied per line at the point it is turned into messages.
     pub stdout: String,
     /// Clamped stderr, destined for the air **only when the action failed** —
     /// see [`Outcome::failure_line`]. A script therefore has to keep both
@@ -300,10 +303,8 @@ pub async fn run(action: &ActionSpec, ctx: &Message, dir: &Path) -> Outcome {
         };
     };
 
-    // A script may print far more than one frame. Clamp before the
-    // template sees it, so `{{stdout}}` can never build an over-long
-    // reply that hangs the radio.
-    let stdout = crate::verbs::clamp(&stdout, MAX_REPLY_BYTES);
+    // stderr is still clamped as one blob: only its last line is ever relayed,
+    // and that is a single message however much the script wrote.
     let stderr = crate::verbs::clamp(&stderr, MAX_STDERR_BYTES);
     let success = status.success();
 
@@ -364,6 +365,7 @@ async fn join(task: Option<JoinHandle<String>>) -> String {
 mod tests {
     use super::*;
     use crate::parse;
+    use crate::verbs::MAX_REPLY_BYTES;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -568,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_successful_script_reports_its_clamped_stdout() {
+    async fn a_successful_script_reports_its_stdout() {
         let dir = sandbox("run");
         write_script(&dir, "say.sh", "#!/bin/sh\necho armed\n");
 
@@ -580,6 +582,36 @@ mod tests {
         let outcome = run(&action, &ctx, &dir).await;
         assert!(outcome.success, "{outcome:?}");
         assert_eq!(outcome.stdout, "armed\n");
+    }
+
+    /// Every line survives, because `split_reply` is what decides how many
+    /// messages there are and it needs to see them all. Clamping here would
+    /// truncate a five-machine list at 150 bytes and the caller would never know
+    /// two entries were missing.
+    #[tokio::test]
+    async fn a_multiline_stdout_is_preserved_intact() {
+        let dir = sandbox("multiline");
+        write_script(
+            &dir,
+            "say.sh",
+            "#!/bin/sh\necho '1/3 server a not ok'\necho '2/3 stack b unhealthy'\necho '3/3 stack c down'\n",
+        );
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "say.sh".into(),
+            ..ActionSpec::default()
+        };
+        let outcome = run(&action, &ctx, &dir).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert_eq!(
+            outcome.stdout.lines().collect::<Vec<_>>(),
+            [
+                "1/3 server a not ok",
+                "2/3 stack b unhealthy",
+                "3/3 stack c down"
+            ]
+        );
     }
 
     /// A failing action answers with the script's own last line of stderr.
@@ -742,10 +774,13 @@ mod tests {
         assert!(error.contains("timed out"), "{error:?}");
     }
 
-    /// One reply, one frame: a script that prints a paragraph must not produce
-    /// an over-long reply that hangs the radio.
+    /// A script that prints a paragraph must not put an over-long frame on the air.
+    ///
+    /// The budget used to be enforced here, on the whole blob. It is enforced
+    /// per line in `split_reply` instead, so that is what this asserts — the
+    /// count is capped too, because 200 lines is 200 transmissions.
     #[tokio::test]
-    async fn a_very_chatty_script_is_clamped() {
+    async fn a_very_chatty_script_becomes_a_capped_number_of_frames() {
         let dir = sandbox("chatty");
         write_script(
             &dir,
@@ -760,10 +795,18 @@ mod tests {
         };
         let outcome = run(&action, &ctx, &dir).await;
         assert!(outcome.success);
+
+        let replies = crate::verbs::split_reply(&outcome.stdout);
+        assert_eq!(replies.len(), crate::verbs::MAX_REPLIES + 1, "{replies:?}");
+        for reply in &replies {
+            assert!(reply.len() <= MAX_REPLY_BYTES, "{} bytes", reply.len());
+        }
+        // The exact count depends on MAX_CAPTURE_BYTES and the line width, so
+        // assert the shape rather than a number that is incidental to both.
+        let last = replies.last().unwrap();
         assert!(
-            outcome.stdout.len() <= MAX_REPLY_BYTES,
-            "{} bytes",
-            outcome.stdout.len()
+            last.starts_with('+') && last.ends_with(" more"),
+            "overflow summary was {last:?}"
         );
     }
 }

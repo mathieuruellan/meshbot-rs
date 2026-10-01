@@ -42,7 +42,7 @@ environment variable means editing `config.example.yaml` (and
 | `ha-entity.sh` | `<entity_id>` | `HA_URL`, `HA_TOKEN` |
 | `ha-service.sh` | `<domain.service> <entity_id>` | `HA_URL`, `HA_TOKEN` |
 | `internet-status.sh` | `<target>...` | none |
-| `komodo-status.sh` | none | `KOMODO_URL`, `KOMODO_TOKEN` |
+| `komodo-status.sh` | none | `KOMODO_URL`, `KOMODO_KEY`, `KOMODO_SECRET` |
 | `pve-reboot.sh` | `<word> <vmid> <kind>` | `PVE_URL`, `PVE_NODE`, `PVE_TOKEN_GUEST`, `PVE_TOKEN_HOST`, `PVE_ALLOW_REBOOT` |
 
 Arguments are either `{{placeholders}}` that expand to a declared value, or

@@ -349,62 +349,75 @@ async fn handle_message(
         channel_idx,
     ) {
         Decision::Ignore => {}
-        Decision::Reply(reply) => send(meshcore, channel_idx, &reply).await,
+        Decision::Reply(reply) => send(meshcore, channel_idx, &[reply]).await,
         Decision::Execute { action, ctx } => {
             let outcome = script::run(action, &ctx, dir).await;
-            let reply = render(action, &ctx, &outcome);
-            send(meshcore, channel_idx, &reply).await;
+            let replies = render(action, &ctx, &outcome);
+            send(meshcore, channel_idx, &replies).await;
         }
     }
 }
 
-/// Build the one reply an action produces.
+/// Build the replies an action produces — one message per line of its template.
 ///
 /// A failed action never gets to render its template: the template is where
 /// `{{stdout}}` goes, and a partially-run action's output is not a result worth
-/// broadcasting. A template that cannot expand is a config bug, so it degrades
-/// to the generic failure line and is logged loudly rather than panicking in the
-/// middle of the event loop.
-fn render(action: &verbs::ActionSpec, ctx: &parse::Context, outcome: &script::Outcome) -> String {
+/// broadcasting. A failure is therefore always a single message. A template that
+/// cannot expand is a config bug, so it degrades to the generic failure line and
+/// is logged loudly rather than panicking in the middle of the event loop.
+fn render(
+    action: &verbs::ActionSpec,
+    ctx: &parse::Context,
+    outcome: &script::Outcome,
+) -> Vec<String> {
     if !outcome.success {
-        return outcome.failure_line();
+        return vec![outcome.failure_line()];
     }
     // Passed even when empty: an action that succeeds silently with a
     // `{{stdout}}` reply should say nothing rather than fail to render.
     match script::expand(&action.reply, ctx, Some(&outcome.stdout)) {
-        Ok(reply) => verbs::clamp(&reply, verbs::MAX_REPLY_BYTES),
+        Ok(reply) => verbs::split_reply(&reply),
         Err(err) => {
             tracing::warn!(script = %action.script, %err, "reply template did not expand");
-            "action failed".to_string()
+            vec!["action failed".to_string()]
         }
     }
 }
 
-/// Put one reply on the air.
+/// Put each reply on the air, one message at a time.
 ///
 /// `send_channel_msg` appends the bytes with no length check, so an over-long
 /// reply hangs on the radio rather than truncating. The clamp is repeated here
 /// even though `render` already did it: this is the last code that touches the
 /// radio, so it is the last place a missing clamp would hurt.
-async fn send(meshcore: &MeshCore, channel_idx: u8, reply: &str) {
-    let text = verbs::clamp(reply, verbs::MAX_REPLY_BYTES);
-    if text.is_empty() {
+///
+/// Sequential, and a failure does not stop the rest. A partially-delivered list
+/// is still more use than none of it, and airtime is too scarce to spend on a
+/// retry of the whole thing.
+async fn send(meshcore: &MeshCore, channel_idx: u8, replies: &[String]) {
+    if replies.is_empty() {
         tracing::info!(channel_idx, "action produced no reply");
         return;
     }
-    tracing::info!(channel_idx, %text, "replying");
-    // Scoped so the command lock is released before the next await. Sequential
-    // handling means nothing else contends for it, but holding a mutex across
-    // unrelated awaits is a habit worth not forming.
-    let result = {
-        let commands = meshcore.commands().lock().await;
-        commands.send_channel_msg(channel_idx, &text, None).await
-    };
-    if let Err(err) = result {
-        // A failed reply must not take the bot down: the next message still
-        // needs handling, and mesh airtime is scarce enough that a retry would
-        // be worse than a miss.
-        tracing::warn!(channel_idx, %err, "reply not sent");
+    for reply in replies {
+        let text = verbs::clamp(reply, verbs::MAX_REPLY_BYTES);
+        if text.is_empty() {
+            continue;
+        }
+        tracing::info!(channel_idx, %text, "replying");
+        // Scoped so the command lock is released before the next await. Sequential
+        // handling means nothing else contends for it, but holding a mutex across
+        // unrelated awaits is a habit worth not forming.
+        let result = {
+            let commands = meshcore.commands().lock().await;
+            commands.send_channel_msg(channel_idx, &text, None).await
+        };
+        if let Err(err) = result {
+            // A failed reply must not take the bot down: the next message still
+            // needs handling, and mesh airtime is scarce enough that a retry would
+            // be worse than a miss.
+            tracing::warn!(channel_idx, %err, "reply not sent");
+        }
     }
 }
 
@@ -740,6 +753,16 @@ mod tests {
         parse::parse(input).unwrap()
     }
 
+    /// A reply that is meant to be a single message.
+    ///
+    /// Asserting the count separately is what makes a regression legible: a
+    /// script that starts printing two lines fails here as "expected one
+    /// message" rather than as a slice comparison that never matches.
+    fn only(replies: Vec<String>) -> String {
+        assert_eq!(replies.len(), 1, "expected one message, got {replies:?}");
+        replies.into_iter().next().unwrap()
+    }
+
     #[test]
     fn a_failed_action_never_renders_its_template() {
         let action = verbs::ActionSpec {
@@ -757,8 +780,10 @@ mod tests {
             // different thing from having failed to start.
             error: None,
         };
-        let reply = render(&action, &ctx_for("reboot alpha"), &outcome);
-        assert_eq!(reply, "action did not succeed");
+        assert_eq!(
+            only(render(&action, &ctx_for("reboot alpha"), &outcome)),
+            "action did not succeed"
+        );
     }
 
     #[test]
@@ -776,7 +801,7 @@ mod tests {
         };
         // The error names a host path, which is not something to put on a mesh.
         assert_eq!(
-            render(&action, &ctx_for("alarm"), &outcome),
+            only(render(&action, &ctx_for("alarm"), &outcome)),
             "action failed"
         );
     }
@@ -795,7 +820,7 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            render(&action, &ctx_for("garage open"), &outcome),
+            only(render(&action, &ctx_for("garage open"), &outcome)),
             "opening"
         );
     }
@@ -816,7 +841,7 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            render(&action, &ctx_for("alarm"), &outcome),
+            only(render(&action, &ctx_for("alarm"), &outcome)),
             "action failed"
         );
     }
@@ -837,11 +862,12 @@ mod tests {
             success: true,
             error: None,
         };
-        assert_eq!(render(&action, &ctx_for("alarm"), &outcome), "");
+        assert!(render(&action, &ctx_for("alarm"), &outcome).is_empty());
     }
 
     /// The last thing before the radio. A script that prints a paragraph must
-    /// not produce a frame the radio cannot send.
+    /// not produce a frame the radio cannot send, and printing more than one
+    /// thing must not produce more messages than the budget allows.
     #[test]
     fn every_reply_fits_in_one_frame() {
         let action = verbs::ActionSpec {
@@ -855,11 +881,44 @@ mod tests {
             success: true,
             error: None,
         };
-        let reply = render(&action, &ctx_for("alarm"), &outcome);
+        let replies = render(&action, &ctx_for("alarm"), &outcome);
         assert!(
-            reply.len() <= verbs::MAX_REPLY_BYTES,
-            "{} bytes",
-            reply.len()
+            replies.len() <= verbs::MAX_REPLIES + 1,
+            "{} messages",
+            replies.len()
+        );
+        for reply in &replies {
+            assert!(
+                reply.len() <= verbs::MAX_REPLY_BYTES,
+                "{} bytes",
+                reply.len()
+            );
+        }
+    }
+
+    /// The point of the feature: a script that reports several things puts one
+    /// on the air per line, rather than being truncated to a single frame.
+    #[test]
+    fn each_line_of_stdout_becomes_its_own_message() {
+        let action = verbs::ActionSpec {
+            script: "komodo-status.sh".into(),
+            reply: "{{stdout}}".into(),
+            ..verbs::ActionSpec::default()
+        };
+        let outcome = script::Outcome {
+            stdout: "1/3 server biniou not ok\n2/3 stack meshcore unhealthy\n3/3 stack ha down\n"
+                .into(),
+            stderr: String::new(),
+            success: true,
+            error: None,
+        };
+        assert_eq!(
+            render(&action, &ctx_for("komodo"), &outcome),
+            [
+                "1/3 server biniou not ok",
+                "2/3 stack meshcore unhealthy",
+                "3/3 stack ha down"
+            ]
         );
     }
 }
