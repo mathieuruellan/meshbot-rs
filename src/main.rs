@@ -285,7 +285,14 @@ async fn handle_message(
     channel: &str,
     channel_idx: u8,
 ) {
-    match decide(&config.table, &config.reserved, latch, text, channel, channel_idx) {
+    match decide(
+        &config.table,
+        &config.reserved,
+        latch,
+        text,
+        channel,
+        channel_idx,
+    ) {
         Decision::Ignore => {}
         Decision::Reply(reply) => send(meshcore, channel_idx, &reply).await,
         Decision::Execute { action, ctx } => {
@@ -598,9 +605,9 @@ mod tests {
     // ---- no reply where there is nothing to say
 
     /// The parser is verb-shaped, not sentence-shaped: any first word is a verb
-    /// guess, so even `"hi there"` becomes verb `hi` with target `there` and gets
-    /// a pointer. Silence therefore happens only for input the parser rejects —
-    /// empty, control characters, over the byte cap, or a third bare word.
+    /// guess, so even `"hi there"` becomes verb `hi` with target `there`. Silence
+    /// therefore has two sources — input the parser rejects, and a verb guess
+    /// that is not near enough to any declared verb to be worth correcting.
     #[test]
     fn input_the_parser_rejects_gets_no_reply() {
         let table = table();
@@ -619,21 +626,24 @@ mod tests {
         }
     }
 
-    /// One bare word is a verb-shaped guess, so it earns a pointer. This is the
-    /// "typos get a pointer, not a rejection" rule, and it is why the silence
-    /// test above has to use input the parser rejects rather than any word.
+    /// A near-miss earns a pointer; a word that is not a near-miss gets nothing.
+    /// The parser is verb-shaped, not sentence-shaped, so every one-word message
+    /// becomes a verb guess — and these channels are not exclusively ours, so a
+    /// reply to every greeting is a bot talking over itself.
     #[test]
-    fn a_single_unknown_word_gets_a_pointer() {
+    fn only_an_unknown_word_near_a_verb_gets_an_answer() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        for (input, expected) in [("hello", None), ("gerage", Some("garage"))] {
+
+        // Near enough to `garage` to be worth correcting.
+        let near = run_on(table, &mut latch, "gerage", HA);
+        assert!(near.reply().expect("a pointer").contains("garage"));
+
+        // Not near anything: silence, not a correction nobody asked for.
+        for input in ["hello", "bonjour", "meteo"] {
             let d = run_on(table, &mut latch, input, HA);
-            let reply = d.reply().expect("a reply");
-            if let Some(expected) = expected {
-                assert!(reply.contains(expected), "{reply}");
-            } else {
-                assert!(reply.contains("try 'help'"), "{reply}");
-            }
+            assert!(!d.is_execute(), "{input} ran");
+            assert_eq!(d.reply(), None, "{input} was answered");
         }
     }
 

@@ -282,11 +282,14 @@ impl<'a> Resolution<'a> {
                 None => "try 'help'".to_string(),
             }),
             Self::UnknownVerb { input, suggestion } => {
-                let mut line = match suggestion {
-                    Some(s) => format!("unknown: '{input}' - did you mean: {s}?"),
-                    None => format!("unknown: '{input}' - try 'help'"),
-                };
-                line.push_str(" | try 'help'");
+                // A near-miss gets a pointer; a word that is not a near-miss gets
+                // silence. The parser is verb-shaped rather than
+                // sentence-shaped, so every one-word message lands here, and
+                // these channels are not exclusively ours — answering "unknown:
+                // 'hello' - try 'help'" to every greeting is a bot that talks
+                // over itself.
+                let suggestion = suggestion?;
+                let line = format!("unknown: '{input}' - did you mean: {suggestion}? | try 'help'");
                 Some(clamp(&line, MAX_REPLY_BYTES))
             }
             Self::BadArg {
