@@ -68,6 +68,11 @@ async fn main() -> Result<()> {
         .context("send_appstart failed")?;
     tracing::info!(name = %info.name, "app started");
 
+    // Time first, so a channel message the radio sends after connecting
+    // comes with a clock that is at least close. The function is best-effort:
+    // a failure to query or set the clock does not stop the bot.
+    set_radio_clock(&meshcore).await;
+
     verify_channels(&meshcore, &loaded.channels).await?;
 
     // Returns unit, not a Result — there is nothing to await that can fail.
@@ -272,6 +277,75 @@ fn decide<'a>(
             Some(reply) => Decision::Reply(reply),
             None => Decision::Ignore,
         },
+    }
+}
+
+/// How far the radio may fall behind before we bother writing to it.
+///
+/// A device that is a few seconds out has not drifted in any way that matters to
+/// a mesh timestamp, and writing on every reconnect is churn for nothing. A
+/// radio that has been powered down is minutes or years out, which is what this
+/// exists to catch.
+const CLOCK_SKEW_TOLERANCE_SECS: u32 = 60;
+
+/// Whether the radio's clock is behind ours enough to be worth correcting.
+///
+/// The radio keeps no clock worth trusting — it loses time when it is powered
+/// down — so on every connect this is compared against the container clock. Only
+/// a device that is *behind* is written to: one that is ahead was set by hand,
+/// and overwriting that would be the regression rather than the fix.
+fn should_set_clock(device: u32, now: u32) -> bool {
+    now.saturating_sub(device) > CLOCK_SKEW_TOLERANCE_SECS
+}
+
+fn now_secs() -> u32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    u32::try_from(secs).unwrap_or(u32::MAX)
+}
+
+/// Read the radio clock and correct it if it has fallen behind.
+///
+/// Called on every successful connect, which is the only moment worth a radio
+/// round trip.
+///
+/// Best effort. A radio that will not answer a time query must not stop the bot
+/// from answering messages, so a failure here is logged and the run continues.
+/// Read the log to confirm the sync happened: `Device time: N, System time: M`
+/// followed by either `Radio clock updated to: N` or `Device time is current or
+/// ahead - no update needed`.
+///
+/// Note the companion radio sits behind the proxy, which keeps client sockets
+/// open across a radio disconnect and reconnects the port itself. Nothing
+/// breaks the TCP connection, so nothing re-enters this function: a radio
+/// power-cycle leaves the clock stale until the bot restarts. That is a real
+/// gap, and it is the reason the deployment needs a liveness probe.
+async fn set_radio_clock(meshcore: &MeshCore) {
+    let now = now_secs();
+    // One lock for both commands: there is no await between the read and the
+    // write, so nothing else can interleave, and a second acquisition would
+    // open a window where a message handler ran in between.
+    let commands = meshcore.commands().lock().await;
+
+    let device = match commands.get_time().await {
+        Ok(device) => device,
+        Err(err) => {
+            tracing::warn!(%err, "could not read the radio clock; leaving it as it is");
+            return;
+        }
+    };
+    tracing::info!("Device time: {device}, System time: {now}");
+
+    if !should_set_clock(device, now) {
+        tracing::info!("Device time is current or ahead - no update needed");
+        return;
+    }
+
+    match commands.set_time(now).await {
+        Ok(_) => tracing::info!("Radio clock updated to: {now}"),
+        Err(err) => tracing::warn!(%err, "could not set the radio clock"),
     }
 }
 
@@ -654,6 +728,29 @@ mod tests {
         let d = run_on(table, &mut latch, "gerage", HA);
         let reply = d.reply().expect("a suggestion");
         assert!(reply.contains("garage"), "{reply}");
+    }
+
+    #[test]
+    fn the_clock_is_only_written_when_the_radio_is_behind() {
+        let now = 1_700_000_000;
+        // A radio that has been off since the epoch: the case that matters.
+        assert!(should_set_clock(0, now));
+        // Weeks out.
+        assert!(should_set_clock(now - 30 * 86_400, now));
+        // Just out of tolerance.
+        assert!(should_set_clock(now - CLOCK_SKEW_TOLERANCE_SECS - 1, now));
+        // Agreed, or within jitter: leave it alone.
+        assert!(!should_set_clock(now, now));
+        assert!(!should_set_clock(now - CLOCK_SKEW_TOLERANCE_SECS, now));
+        // Ahead: somebody set it by hand, and that is not ours to undo.
+        assert!(!should_set_clock(now + 10_000, now));
+    }
+
+    #[test]
+    fn the_system_clock_reads_as_sane() {
+        // 2024-01-01, so a machine with no clock at all fails visibly rather
+        // than quietly syncing the radio to 1970.
+        assert!(now_secs() > 1_704_067_200, "{}", now_secs());
     }
 
     // ---- reply rendering

@@ -106,6 +106,36 @@ work around it by pinning the host to `latest`: that moves on every merge.
   tag only moves when a release PR is merged. Those are two separate deploy
   paths; the unpinned one is for testing a change, the pinned one is the host.
 
+## The radio clock
+The bot owns it. `set_radio_clock()` runs on every successful connect, reads the
+device time with `GET_DEVICE_TIME`, and writes `SET_DEVICE_TIME` **only when the
+radio is behind the container clock** by more than 60s. A device that is ahead
+was set by hand, and overwriting it would be the regression rather than the fix.
+
+The radio keeps no clock worth trusting: it loses time when powered down, and
+that is what makes this a startup step rather than a nicety. A failure to read
+or set the clock is logged and the run continues — a radio that will not answer
+a time query must not stop the bot from answering messages.
+
+Verify from the logs, never from the exit code:
+
+```bash
+docker logs meshcore-bot-rs 2>&1 | grep -E "Device time|Radio clock updated"
+```
+
+`Device time: N, System time: M` must appear, followed by exactly one of
+`Radio clock updated to: N` or `Device time is current or ahead - no update
+needed`. Neither means the bot never reached the radio.
+
+**Known gap: a radio power-cycle does not re-sync.** The proxy keeps client
+sockets open when the radio disconnects — it flips an internal flag, drops
+commands with `Command dropped: radio not connected`, and reconnects the serial
+port itself — so no TCP connection is broken and nothing re-enters
+`set_radio_clock()`. The clock is stale until the bot restarts. This pre-dates
+this bot (the removed `clock-sync` service had the same gap, since it only ever
+ran at `docker compose up`). Closing it needs a liveness probe on the bot that
+restarts the container after a radio outage.
+
 ## CI and releases
 `.github/workflows/ci.yml` and `.github/workflows/release.yml` exist. Three
 jobs in `ci.yml`:
@@ -182,11 +212,21 @@ host-mounted `.env`: it searches upward from the current directory, so with
 error, so a wrong `WORKDIR` does not fail startup — it leaves every credential
 missing until an action runs.
 
-The container runs as uid 1000, so **everything mounted under
-`/data/meshcore/meshbot-rs` must be world readable and traversable** (`0644` /
-`0755`, not `0600`). `scripts.example/README.md` already installs `0755`; `.env`
-and `config.yaml` are the exposure, and they are the two files that must not be
-`0600`.
+The container runs as uid 1000, so everything mounted under
+`/data/meshcore/meshbot-rs` must be **readable by that uid** — which is a
+question of ownership, not of mode:
+
+```bash
+sudo chown -R 1000:1000 /data/meshcore/meshbot-rs
+```
+
+Chown the directory and `0600` is correct, including for `.env`, which holds HA
+and Proxmox tokens. The alternative — leaving the files owned by another uid and
+relaxing them to `0644` — also works, because a bind mount is read by the
+container's uid rather than mapped to it, but it puts a world-readable copy of
+every credential on the host. `scripts.example/README.md` installs the scripts
+`0755`, since the bot executes them directly and they are tracked in a public
+repository, so there is nothing to hide in them.
 
 ### First publish, by hand
 A package published to GHCR with `GITHUB_TOKEN` is created **private**, and
