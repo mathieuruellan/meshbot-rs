@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.3.0...v0.4.0) (2026-10-01)
+
+
+### Features
+
+* multi-line action replies; fix(scripts): komodo uses key+secret and real endpoints ([fbea379](https://github.com/mathieuruellan/meshbot-rs/commit/fbea3797e20af160ca5e1752a88b5d125d909f49))
+* multi-line action replies; fix(scripts): komodo uses key+secret… ([9199c9c](https://github.com/mathieuruellan/meshbot-rs/commit/9199c9c10b9405013530f9a3e24a58ce4faf6a3a))
+
 ## [0.3.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.2.0...v0.3.0) (2026-10-01)
 
 
