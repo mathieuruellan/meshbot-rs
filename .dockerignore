@@ -9,8 +9,8 @@ target/
 
 # The single source for tokens. Never in an image, even accidentally.
 .env
-# Host-owned config. Nothing reads it inside the container yet, but the loader
-# will, and the mount is the point.
+# Host-owned config. The loader reads it at startup (MESHBOT_CONFIG), and the
+# mount is the point.
 config.yaml
 
 # Deployed action scripts are host-owned and gitignored; scripts.example/ are

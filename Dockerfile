@@ -59,11 +59,11 @@ RUN apt-get update \
       netbase \
  && rm -rf /var/lib/apt/lists/*
 
-# The script allowlist directory is deliberately NOT created. script_dir()
-# canonicalizes it at startup and treats absence as a hard error, so a missing
-# compose mount stops the bot loudly instead of leaving it answering every
-# command with "action failed" while looking healthy. Creating the directory
-# here would throw that away.
+# The script allowlist directory is deliberately NOT created. The config loader
+# canonicalizes bot.script_dir at startup and treats absence as a hard error, so
+# a missing compose mount stops the bot loudly instead of leaving it answering
+# every command with "action failed" while looking healthy. Creating the
+# directory here would throw that away.
 #
 # This WORKDIR exists for a different reason: dotenvy searches upward from the
 # current directory for `.env`, and with CWD=/ it would never look in /data at
@@ -76,8 +76,9 @@ COPY --from=build /src/target/release/meshbot-rs /usr/local/bin/meshbot-rs
 # Numeric rather than a named user: nothing here calls getpwuid(), so there is
 # no reason to depend on the `passwd` package being present in -slim. It also
 # states the uid the host must be able to read, which is the part that matters:
-# /data/meshcore/meshbot-rs and everything mounted under it have to be world
-# readable and traversable, or this user silently cannot read the .env.
+# chown /data/meshcore/meshbot-rs to 1000:1000 on the host. Otherwise this user
+# silently cannot read the .env, and every credential is missing at action
+# time.
 USER 1000:1000
 
 # The source label is what links the published GHCR package to this repository,

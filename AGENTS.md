@@ -17,25 +17,28 @@ grammar (`src/meshbot.pest`), the flat context with reserved-key poisoning
 confirmation latch (`src/latch.rs`) and the on-air reply path (`decide` /
 `handle_message` / `send` in `src/main.rs`) are implemented and unit-tested.
 Messages that resolve to an action now run the declared script and put one reply
-on the air. **Still missing**: the config loader — `config.example.yaml` documents
-a target schema that nothing reads yet, and `default_verbs()` hardcodes the same
-vocabulary as a placeholder. Do not assume a feature exists because it is
-described below — check `src/`.
+on the air. The config loader (`src/config.rs`) is implemented too, so
+`config.example.yaml` is the real schema and is validated by the test suite; the
+verb table, the channel map and the script directory all come from
+`config.yaml`. It also owns the radio clock (`set_radio_clock`). Do not assume a
+feature exists because it is described below — check `src/`.
 
 ## Build
 ```bash
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 99 unit tests, no radio needed
+cargo test          # 117 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
-language, the latch and the policy, and nothing covers a live connection. Note
-that `cargo run` also needs `MESHBOT_SCRIPT_DIR` to exist — a missing allowlist
-directory is a hard startup error, not a warning. `cargo run` from a dev machine
-will fail to connect unless a proxy is reachable — a clean `cannot connect to …`
-is expected, not a bug. To exercise the real verb table without a deploy:
+language, the latch, the config and the policy, and nothing covers a live
+connection. `cargo run` needs a `config.yaml` (`MESHBOT_CONFIG`, default
+`/data/meshcore/meshbot-rs/config.yaml`) and a reachable script directory — a
+missing one is a hard startup error, not a warning. From a dev machine it will
+then fail to connect unless a proxy is reachable, and a clean
+`cannot connect to …` is expected, not a bug. To exercise the real verb table
+without a deploy:
 
 ```bash
 MESHBOT_SCRIPT_DIR=./scripts.example cargo run
@@ -199,10 +202,13 @@ build time.
 
 Two things the Dockerfile pointedly does *not* do:
 
-- **It does not create the script allowlist directory.** `script_dir()`
-  canonicalizes it and treats absence as a hard startup error, so an absent
-  compose mount stops the bot loudly instead of leaving it answering every
-  command with "action failed" while looking healthy.
+- **It does not create the script allowlist directory.** The config loader
+  canonicalizes `bot.script_dir` and treats absence as a hard startup error, so
+  an absent compose mount stops the bot loudly instead of leaving it answering
+  every command with "action failed" while looking healthy. The loader also
+  returns the directory it validated against, and that is the one scripts are
+  executed from — a script cannot be checked in one directory and run in
+  another.
 - **It does not bake in `.env` or `config.yaml`.** `.dockerignore` excludes them,
   so a local token file cannot reach a published layer by accident.
 
@@ -378,8 +384,8 @@ Recorded so implementation doesn't relitigate them.
   and unreachable from a message: the grammar has no way to express one, so the
   enum still does the work and `reboot somethingElse` fires nothing. The
   literals are placeholders in the tracked config because the repo is public; the
-  real map goes in the gitignored `config.yaml` — once the loader lands, since
-  `default_verbs()` is compiled in until then.
+  real map goes in the gitignored `config.yaml`, which is the only file the
+  loader reads.
 - **The kind picks both the API path and the token**, which is why it travels as
   an argument: `.../qemu/{vmid}/status/reboot`, `.../lxc/{vmid}/status/reboot`,
   or `.../status/reboot` for the node itself, which has no vmid segment and takes
@@ -452,8 +458,12 @@ Recorded so implementation doesn't relitigate them.
 gitignored `/scripts` directory. Copy, never symlink — a symlink into this
 checkout turns a local edit into a repo change. Read
 `scripts.example/README.md` before changing one: the argument and env contract
-is duplicated in `default_verbs()` and in `config.example.yaml`, and all three
-have to move together.
+is documented in that README and declared in `config.example.yaml`, and both have
+to move together. The loader checks the config side — a declared script must
+exist in `script_dir`, and a declared `env:` name must be a real environment
+name — but it cannot check the script's own argv contract, so a mismatch is a
+runtime failure. `config.example.yaml` is validated by the test suite, which is
+why a schema change and an example change are the same commit.
 
 `pve-reboot.sh` is inert unless `PVE_ALLOW_REBOOT=1`, and it is the only
 destructive template. Keep it that way: a copied script that can take a

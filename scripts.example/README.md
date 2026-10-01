@@ -34,7 +34,7 @@ commit — this repository is public.
 ## The contract
 
 The verb table decides what each script gets. Renaming an argument or an
-environment variable means editing `default_verbs()` in `src/verbs.rs` (and
+environment variable means editing `config.example.yaml` (and
 `config.yaml` once the loader lands) in the same change.
 
 | script | arguments | environment |

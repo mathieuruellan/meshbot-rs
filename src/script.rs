@@ -30,26 +30,9 @@ use tokio::task::JoinHandle;
 use crate::parse::Context as Message;
 use crate::verbs::{ActionSpec, MAX_REPLY_BYTES};
 
-/// Where action scripts live on the host, mounted read-only.
-///
-/// Overridable so the examples in this repo can be run without a deploy:
-/// `MESHBOT_SCRIPT_DIR=./scripts.example`.
-const DEFAULT_SCRIPT_DIR: &str = "/data/meshcore/meshbot-rs/scripts";
-
 /// Longest a script may take before it is killed and the reply is a failure.
 /// A per-action `timeout_secs` overrides this.
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
-
-/// The allowlist directory, validated at startup.
-///
-/// Overridable so the examples in this repo can be run without a deploy:
-/// `MESHBOT_SCRIPT_DIR=./scripts.example`.
-pub fn script_dir() -> PathBuf {
-    match std::env::var("MESHBOT_SCRIPT_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(DEFAULT_SCRIPT_DIR),
-    }
-}
 
 /// Resolve a declared script name to a path inside the allowlist directory.
 ///

@@ -61,6 +61,10 @@ pub struct Loaded {
     /// The `.env` names a template or script can reach, which a message may not
     /// set as a slot.
     pub reserved: Reserved,
+    /// The canonicalized directory every script name in `table` was validated
+    /// against. Handed back rather than re-resolved by the caller, so a script
+    /// cannot be validated in one directory and then executed in another.
+    pub script_dir: PathBuf,
 }
 
 /// Read, parse, validate, and prepare the config. The script directory is
@@ -80,15 +84,15 @@ pub fn load(path: &Path) -> Result<Loaded> {
         )
     })?;
 
-    build(parsed, &dir).with_context(|| format!("invalid config {}", path.display()))
+    build(parsed, dir).with_context(|| format!("invalid config {}", path.display()))
 }
 
-/// Validate a parsed config against an already-canonical script directory.
+/// Validate a parsed config against the script directory, already canonicalized.
 ///
 /// Split from [`load`] so tests exercise the real validation without a
 /// deployment on disk, and without setting a process-wide env var to redirect
 /// the script directory.
-fn build(cfg: Config, dir: &Path) -> Result<Loaded> {
+fn build(cfg: Config, dir: PathBuf) -> Result<Loaded> {
     if cfg.schema != SCHEMA {
         bail!(
             "config declares schema {} but this build speaks schema {SCHEMA}",
@@ -97,12 +101,13 @@ fn build(cfg: Config, dir: &Path) -> Result<Loaded> {
     }
 
     let channels = validate_channels(&cfg.bot.channels)?;
-    let reserved = validate_verbs(&cfg.verbs, &channels, dir)?;
+    let reserved = validate_verbs(&cfg.verbs, &channels, &dir)?;
 
     Ok(Loaded {
         channels,
         table: VerbTable::new(cfg.verbs),
         reserved,
+        script_dir: dir,
     })
 }
 
@@ -122,7 +127,7 @@ fn effective_script_dir(bot: &Bot) -> PathBuf {
 #[cfg(test)]
 pub fn from_yaml(raw: &str, dir: &Path) -> Result<Loaded> {
     let parsed: Config = serde_norway::from_str(raw).context("cannot parse config")?;
-    build(parsed, dir)
+    build(parsed, dir.to_path_buf())
 }
 
 /// The tracked example config, parsed and validated once.
@@ -495,6 +500,16 @@ mod tests {
         let raw = "schema: 1\nbot:\n  channels: {2: admin, 3: admin}\n  script_dir: /unused\nverbs:\n  - name: garage\n    channel: admin\n    get:\n      script: ok.sh\n      reply: a\n";
         let err = from_yaml(raw, &scripts()).unwrap_err().to_string();
         assert!(err.contains("twice"), "{err}");
+    }
+
+    /// The directory handed back must be the one the scripts were checked in.
+    /// It used to be re-resolved by the caller from `MESHBOT_SCRIPT_DIR` and a
+    /// hardcoded default, so a config naming a different `bot.script_dir` was
+    /// validated in one directory and would have been executed in another.
+    #[test]
+    fn the_validated_directory_is_the_one_returned() {
+        let loaded = config("  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n").unwrap();
+        assert_eq!(loaded.script_dir, scripts());
     }
 
     /// The shipped example is the schema's documentation, so it is validated by

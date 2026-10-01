@@ -15,7 +15,7 @@ mod parse;
 mod script;
 mod verbs;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -39,13 +39,14 @@ async fn main() -> Result<()> {
     let config_path =
         std::env::var("MESHBOT_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
     let loaded = config::load(std::path::Path::new(&config_path))?;
-    let script_dir = script_dir()?;
     tracing::info!(
         config = %config_path,
         channels = loaded.channels.len(),
         verbs = loaded.table.names().join(" "),
+        script_dir = %loaded.script_dir.display(),
         "config loaded"
     );
+    let script_dir = &loaded.script_dir;
 
     let host = std::env::var("MESHCORE_HOST").unwrap_or_else(|_| "proxy".to_string());
     let port: u16 = std::env::var("MESHCORE_PORT")
@@ -108,7 +109,7 @@ async fn main() -> Result<()> {
                 &meshcore,
                 &loaded,
                 &mut latch,
-                &script_dir,
+                script_dir,
                 &msg.text,
                 name,
                 msg.channel_idx,
@@ -118,26 +119,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// The script allowlist directory, checked once at startup.
-///
-/// A missing directory is a hard startup failure rather than a warning: the
-/// compose file mounts it, so its absence means the mount is wrong, and a bot
-/// that answers `garage` with "action failed" while looking healthy hides the
-/// real problem. The config loader has already canonicalized it — it validates
-/// every declared script name against this directory — so this re-reads it only
-/// to log where it is.
-fn script_dir() -> Result<PathBuf> {
-    let dir = script::script_dir();
-    std::fs::canonicalize(&dir).with_context(|| {
-        format!(
-            "action script directory {} is not usable; set MESHBOT_SCRIPT_DIR to override",
-            dir.display()
-        )
-    })?;
-    tracing::info!(dir = %dir.display(), "script allowlist directory");
-    Ok(dir)
 }
 
 /// What a message should cause.

@@ -157,16 +157,12 @@ impl Context {
 
     /// Whether the message carried the confirmation token, e.g. `ok` in
     /// `reboot alpha ok`.
-    // Dead until the latch consults it.
-    #[allow(dead_code)]
     pub fn confirmed(&self) -> bool {
         self.values
             .get("confirm")
             .is_some_and(|v| v.to_string().eq_ignore_ascii_case(CONFIRM_WORD))
     }
 
-    // Dead until `{{slot}}` interpolation in actions reads it.
-    #[allow(dead_code)]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.values.get(key)
     }
@@ -209,8 +205,6 @@ impl Context {
     /// Every reserved key is excluded, not just `verb` and `target`. The engine
     /// injects `channel` and `channel_idx` after parsing, and including them
     /// would key the latch on `reboot alpha channel=#admin channel_idx=3`.
-    // Dead until the latch keys on it.
-    #[allow(dead_code)]
     pub fn canonical(&self) -> String {
         let mut out = String::from(self.verb().unwrap_or_default());
         if let Some(target) = self.target() {
