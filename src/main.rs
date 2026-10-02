@@ -159,11 +159,30 @@ fn decide<'a>(
     table: &'a verbs::VerbTable,
     reserved: &parse::Reserved,
     latch: &mut latch::Latch,
-    text: &str,
+    raw: &str,
     channel: &str,
     channel_idx: u8,
 ) -> Decision<'a> {
-    let mut ctx = match parse::parse_with(text, reserved) {
+    // The marker decides whether this is a command at all. Everything below
+    // works on the text *after* it, never on the raw message, so the sender tag
+    // and the marker cannot leak into a verb name or an argument.
+    let Some(command) = parse::command_text(raw) else {
+        let body = parse::sender_body(raw);
+        return if parse::parse_with(body, reserved).is_ok() {
+            // Addressed to us and spelled correctly, but missing the marker. Say
+            // so rather than staying silent: silence is indistinguishable from
+            // the bot being down, which is how a genuine outage presents too.
+            tracing::info!(channel_idx, "command without marker");
+            Decision::Reply(format!("commands start with '{}'", parse::COMMAND_MARKER))
+        } else {
+            // Ordinary chat. Debug, not info: these channels are busy, and an
+            // info line per message would bury the ones that matter.
+            tracing::debug!(channel_idx, "not addressed as a command");
+            Decision::Ignore
+        };
+    };
+
+    let mut ctx = match parse::parse_with(command, reserved) {
         Ok(ctx) => ctx,
         Err(err) => {
             // Not a command, so no reply: these channels are not exclusively
@@ -223,7 +242,11 @@ fn decide<'a>(
                     // The prompt echoes what was typed, not the canonical
                     // spelling: prompting `reboot alpha ok` after `reboot
                     // delta` would confirm a different machine.
-                    return Decision::Reply(format!("confirm: '{}'", verbs::confirm_text(text)));
+                    //
+                    // `command`, not `text`: the raw message still carries the
+                    // sender tag and the marker, and echoing those would ask
+                    // the user to confirm a string that can never parse.
+                    return Decision::Reply(format!("confirm: '{}'", verbs::confirm_text(command)));
                 }
                 if !latch.take(&ctx.canonical()) {
                     // Expired, never armed, or a different key. Answer, and do
@@ -533,11 +556,25 @@ mod tests {
         &config().table
     }
 
-    /// Run one message through the whole policy and return what it decided.
+    /// Run one command *body* through the whole policy and return what it
+    /// decided. The marker is prepended here, so each test reads as the command
+    /// rather than as the wire framing around it; the framing — the marker and
+    /// the sender tag ahead of it — is covered by `parse`'s tests and by
+    /// [`a_nickname_tagged_message_is_a_command`], which goes through [`run_raw`].
     fn run_on<'a>(
         table: &'a verbs::VerbTable,
         latch: &mut latch::Latch,
         text: &str,
+        channel: &str,
+    ) -> Decision<'a> {
+        run_raw(table, latch, &format!("!{text}"), channel)
+    }
+
+    /// Run a raw message, marker and sender tag included.
+    fn run_raw<'a>(
+        table: &'a verbs::VerbTable,
+        latch: &mut latch::Latch,
+        raw: &str,
         channel: &str,
     ) -> Decision<'a> {
         let loaded = config();
@@ -547,11 +584,21 @@ mod tests {
             .find(|(_, n)| n == channel)
             .map(|(i, _)| *i)
             .expect("channel is in the listen set");
-        decide(table, &loaded.reserved, latch, text, channel, idx)
+        decide(table, &loaded.reserved, latch, raw, channel, idx)
     }
 
     // ---- the latch, which is the only thing standing between a message and a
     // ---- reboot. These are the tests that matter most in this file.
+
+    /// The on-air shape: the app prepends the sender, then the marker, then the
+    /// verb. `decide` must see `komodo`, not the tag and not the marker.
+    #[test]
+    fn a_nickname_tagged_message_is_a_command() {
+        let table = table();
+        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let d = run_raw(table, &mut latch, "NICKNAME: !komodo", ADMIN);
+        assert!(d.is_execute(), "the tag and marker were not stripped");
+    }
 
     #[test]
     fn reboot_needs_two_messages() {

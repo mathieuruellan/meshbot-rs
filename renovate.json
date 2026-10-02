@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":enableVulnerabilityAlerts"],
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 10,
+  "packageRules": [
+    {
+      "matchManagers": ["dockerfile"],
+      "matchPackageNames": ["rust"],
+      "groupName": "Rust toolchain"
+    },
+    {
+      "matchDepTypes": ["toolchain"],
+      "groupName": "Rust toolchain"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["dtolnay/rust-toolchain"],
+      "groupName": "Rust toolchain"
+    },
+    {
+      "matchPackageNames": ["pest", "pest_derive"],
+      "groupName": "pest"
+    }
+  ]
+}
