@@ -206,11 +206,48 @@ Two consequences worth knowing before editing the workflows:
   version and appear in no changelog. Enable required status checks in the repo
   settings, or the job can be bypassed.
 
-The toolchain is pinned twice and the two cannot read each other:
+The toolchain is pinned three times and none of the three can read each other:
 `rust-toolchain.toml` (`channel = "1.98.1"`, which also gives local builds the
-same compiler CI uses) and `ARG RUST_VERSION` in the Dockerfile (a minor, since
-the tag is `rust:1.98-slim-bookworm`). Bump them together. Current stable Rust
-is 1.98.1; edition 2024 needs 1.85 or newer.
+same compiler CI uses), `ARG RUST_VERSION` in the Dockerfile (a minor, since
+the tag is `rust:1.98-slim-bookworm`), and `dtolnay/rust-toolchain@1.98.1` in the
+`checks` job. Bump them together — Renovate does it in one PR, see below. Current
+stable Rust is 1.98.1; edition 2024 needs 1.85 or newer.
+
+### Renovate
+`renovate.json` at the repo root, run by `.github/workflows/renovate.yml` on
+Mondays at 05:00 UTC and by hand with a `dry_run` input. It manages the cargo
+dependencies and `Cargo.lock`, the GitHub Action pins, and the `debian` base
+image.
+
+- **`RENOVATE_TOKEN` is a PAT and it is the only secret in this repo.** Not
+  `GITHUB_TOKEN`: Renovate opens PRs with it, and a PR opened by `GITHUB_TOKEN`
+  starts no workflow run, so the `checks` and `commitlint` jobs would never see
+  it. Autodiscover plus `RENOVATE_AUTODISCOVER_FILTER`, rather than
+  `RENOVATE_REPOSITORIES`, because the token can see every repo on the account
+  and the filter is what stops Renovate opening PRs anywhere else.
+- **The Mend hosted app is deliberately not installed here.** concept2 runs both
+  and its scheduled job never opens a PR — every PR on that repo is authored by
+  `app/renovate`, at times that match no cron run. Copying the app as well would
+  mean two Renovates racing for the same branches. One mover of files.
+- **The toolchain is the exception to "one dependency, one PR".** Those three
+  pins are three different dependency names, which Renovate cannot group on its
+  own, so `renovate.json` gives all three a shared `groupName`. The result moves
+  `1.98.1` → `1.99.0` and `1.98` → `1.99` in a single PR. It is deliberately
+  *not* a regex customManager: the `rust-version` datasource returns only
+  three-component versions, so it would either skip the Dockerfile's `1.98` or
+  coerce it to `1.99.0`, which is not a real `rust:` tag.
+- **`pest` and `pest_derive` are grouped for a hard reason.** `pest` pins
+  `pest_derive` to an exact version, and `cargo build --locked` in the
+  Dockerfile turns a lone bump into a build failure rather than a warning.
+- **Nothing merges itself.** No `automerge`, so the commitlint job and a human
+  are both still in the loop. A `debian` codename bump therefore arrives as a PR
+  and needs the package list below re-validated.
+- **A merged dependency PR is a patch release**, which is what produces the next
+  bare version for the Renovate in the meshcore repo to pin. Do not merge one
+  while a release PR is open: it gets swept into that release.
+- PRs are authored by `mathieuruellan`, because the PAT pushes as the account
+  owner. The `renovate/` branch prefix is the only tell that a PR is not a
+  human's.
 
 ### The image, and what it deliberately does not do
 Runtime is `debian:bookworm-slim` plus `bash`, `ca-certificates`, `curl`, `jq`,
