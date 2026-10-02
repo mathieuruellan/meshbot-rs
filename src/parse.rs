@@ -256,9 +256,7 @@ pub fn sender_body(text: &str) -> &str {
     match text.find(": ") {
         Some(i) if i > 0 => {
             let prefix = &text[..i];
-            if prefix.starts_with(COMMAND_MARKER) {
-                text
-            } else if prefix.contains(' ') || prefix.len() > 32 {
+            if prefix.starts_with(COMMAND_MARKER) || prefix.contains(' ') || prefix.len() > 32 {
                 text
             } else {
                 &text[i + 2..]
@@ -274,7 +272,9 @@ pub fn sender_body(text: &str) -> &str {
 /// without stripping the sender tag first, every real message fails the
 /// grammar's `SOI ~ verb` at its very first character.
 pub fn command_text(text: &str) -> Option<&str> {
-    sender_body(text).strip_prefix(COMMAND_MARKER).map(|s| s.trim_start())
+    sender_body(text)
+        .strip_prefix(COMMAND_MARKER)
+        .map(|s| s.trim_start())
 }
 
 /// Parse with no extra reserved keys. Test shorthand for [`parse_with`].
