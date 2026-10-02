@@ -29,12 +29,18 @@ below — check `src/`.
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 131 unit tests, no radio needed
+cargo test          # 133 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
 language, the latch, the config and the policy, and nothing covers a live
-connection. `cargo run` needs a `config.yaml` (`MESHBOT_CONFIG`, default
+connection. The `script` tests do fork real children, so they are the only ones
+that touch the process table: they take `SPAWN_SLOT` and run one at a time
+(`src/script.rs`), because ten concurrent spawns across ten per-test runtimes is
+how this module once failed on CI — `action failed` where a script's own failure
+line was expected, and no way to tell a fork that failed from a test that
+asserted the wrong thing.
+`cargo run` needs a `config.yaml` (`MESHBOT_CONFIG`, default
 `/data/meshcore/meshbot-rs/config.yaml`) and a reachable script directory — a
 missing one is a hard startup error, not a warning. From a dev machine it will
 then fail to connect unless a proxy is reachable, and a clean
@@ -140,6 +146,19 @@ port itself — so no TCP connection is broken and nothing re-enters
 this bot (the removed `clock-sync` service had the same gap, since it only ever
 ran at `docker compose up`). Closing it needs a liveness probe on the bot that
 restarts the container after a radio outage.
+
+**Known gap: a backgrounded script holds the reply past its own deadline.**
+`script::run` kills the child at `timeout_secs`, then drains both pipes to EOF
+before it returns — and a process the script started in the background inherits
+both. So `nohup something &` keeps the action, and with it the bot's
+one-message-at-a-time loop, waiting for that process to exit, however long that
+takes: measured at the full lifetime of the grandchild, not the deadline. The
+kill is a `SIGKILL` to the direct child only, so nothing else ends it. The two
+timeout tests redirect their `sleep` to `/dev/null` for exactly this reason —
+they measure the deadline, and waiting on EOF instead would make them 30-second
+tests. The fix is either a process group (`process_group(0)` at spawn, `killpg`
+at the deadline) or a bounded drain that keeps whatever was captured; undecided,
+and no tracked script backgrounds anything.
 
 ## CI and releases
 `.github/workflows/ci.yml` and `.github/workflows/release.yml` exist. Three

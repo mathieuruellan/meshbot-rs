@@ -34,6 +34,15 @@ use crate::verbs::ActionSpec;
 /// A per-action `timeout_secs` overrides this.
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
+/// Number of spawns left to fail on purpose, for the tests.
+///
+/// The branch this reaches — the one that answers `action failed` because nothing
+/// ran at all — is otherwise reachable only by breaking the machine: a fork that
+/// fails, or an `ETXTBSY` on a busy runner. CI hit exactly that and the test that
+/// noticed it could only report the two strings it had, not why they differed.
+#[cfg(test)]
+static SPAWN_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Resolve a declared script name to a path inside the allowlist directory.
 ///
 /// The directory must already exist: `canonicalize` on the base fails
@@ -204,6 +213,33 @@ pub fn command_for(
     Ok((script, args, env))
 }
 
+/// Fork the child, honouring the test-only injection in [`SPAWN_FAILURES`].
+///
+/// Split out so the injection sits next to the one `spawn` it replaces. In a
+/// normal build this is `command.spawn()` and nothing else: the counter is
+/// `#[cfg(test)]`, so no shipped binary pays for it.
+#[cfg(not(test))]
+fn spawn_child(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    command.spawn()
+}
+
+/// `SPAWN_FAILURES` is a countdown, decremented by the test that armed it. It is
+/// armed only while the process-spawning tests hold `SPAWN_SLOT`, so "the next
+/// spawn" is unambiguous.
+#[cfg(test)]
+fn spawn_child(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    use std::sync::atomic::Ordering;
+    let armed = SPAWN_FAILURES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok();
+    if armed {
+        return Err(std::io::Error::other("spawn failed (injected by test)"));
+    }
+    command.spawn()
+}
+
 /// Run a verb's action and return what it produced.
 ///
 /// Never propagates an error to the caller: a failed action is a reply, not a
@@ -224,29 +260,29 @@ pub async fn run(action: &ActionSpec, ctx: &Message, dir: &Path) -> Outcome {
         }
     };
 
-    let mut child = Command::new(&script);
-    child.args(args.iter().map(OsStr::new));
+    let mut command = Command::new(&script);
+    command.args(args.iter().map(OsStr::new));
     // The order matters: clear first, then add the allowlist. Reversed, the
     // bot's own environment would be the base and the allowlist would merely
     // override a few names in it.
-    child.env_clear();
+    command.env_clear();
     for (name, value) in &env {
-        child.env(name, value);
+        command.env(name, value);
     }
-    child.stdin(Stdio::null());
-    child.stdout(Stdio::piped());
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
     // Piped rather than nulled: a failing action's last stderr line becomes the
     // reply, which is the only diagnostic an operator asking for a reboot by
     // name ever sees. Both pipes are drained by tasks below, so a chatty script
     // cannot fill a buffer and block, and its output cannot interleave into the
     // bot's own logs. On success stderr is logged and not sent.
-    child.stderr(Stdio::piped());
+    command.stderr(Stdio::piped());
     // The child is killed explicitly on timeout. `kill_on_drop` stays on as a
     // backstop for the paths that return early, so no future can leave a script
     // running past its deadline.
-    child.kill_on_drop(true);
+    command.kill_on_drop(true);
 
-    let mut child = match child.spawn() {
+    let mut child = match spawn_child(&mut command) {
         Ok(child) => child,
         Err(err) => {
             tracing::warn!(script = %script.display(), %err, "spawn failed");
@@ -369,6 +405,27 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// Held by every test that forks a child, for the length of that test.
+    ///
+    /// Serialised on purpose. A `#[tokio::test]` runs on its own current-thread
+    /// runtime, so N of them forking at once means N runtimes and N pairs of
+    /// pipes in one process — and an occasional fork that fails, or a pipe close
+    /// that arrives late, then shows up as a test failure with nothing in the
+    /// message. That is not hypothetical: CI saw this module assert the wrong
+    /// string because a spawn failed for a reason the test could not see. None of
+    /// these tests measure anything about each other, and the whole module costs
+    /// milliseconds once the sleeping ones stop sleeping.
+    ///
+    /// Tokio's mutex rather than `std`'s, because the guard is held across the
+    /// test's awaits by definition. It does not poison, which is what is wanted:
+    /// these tests share no state, so a panic in one says nothing about the next
+    /// one's sandbox.
+    static SPAWN_SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn spawn_slot() -> tokio::sync::MutexGuard<'static, ()> {
+        SPAWN_SLOT.lock().await
+    }
 
     /// A private directory per test, so parallel tests never share a path.
     fn sandbox(tag: &str) -> PathBuf {
@@ -571,6 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_script_reports_its_stdout() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("run");
         write_script(&dir, "say.sh", "#!/bin/sh\necho armed\n");
 
@@ -590,6 +648,7 @@ mod tests {
     /// two entries were missing.
     #[tokio::test]
     async fn a_multiline_stdout_is_preserved_intact() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("multiline");
         write_script(
             &dir,
@@ -623,6 +682,7 @@ mod tests {
     /// broadcast as if it were the outcome.
     #[tokio::test]
     async fn a_failing_script_replies_with_its_last_stderr_line() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("fail");
         write_script(
             &dir,
@@ -636,6 +696,10 @@ mod tests {
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
+        assert!(
+            outcome.error.is_none(),
+            "the script did not run: {outcome:?}"
+        );
         assert!(!outcome.success);
         assert!(
             !outcome.failure_line().contains("looking up"),
@@ -646,6 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_with_nothing_on_stderr_stays_generic() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("silent-fail");
         write_script(&dir, "quiet-fail.sh", "#!/bin/sh\nexit 3\n");
 
@@ -654,22 +719,94 @@ mod tests {
             script: "quiet-fail.sh".into(),
             ..ActionSpec::default()
         };
-        assert_eq!(
-            run(&action, &ctx, &dir).await.failure_line(),
-            "action did not succeed"
+        let outcome = run(&action, &ctx, &dir).await;
+        // Split out from the string comparison on purpose: this line and the one
+        // below differ by whether the script ran, and an assert that folds both
+        // into one string reports the difference without ever saying what caused
+        // it. CI learned that the expensive way.
+        assert!(
+            outcome.error.is_none(),
+            "the script did not run: {outcome:?}"
         );
+        assert_eq!(outcome.failure_line(), "action did not succeed");
+    }
+
+    /// A script that never started says so, and says nothing else.
+    ///
+    /// `action failed` is reserved for exactly this case — nothing ran — as
+    /// against `action did not succeed`, which is a script that ran and failed.
+    /// Both are reachable in production (a missing file, a variable the verb
+    /// entry declares but `.env` does not have, a fork that fails), and neither
+    /// leaves anything on stdout or stderr to relay.
+    ///
+    /// The branch used to be reachable only by breaking the machine, so the line
+    /// above had no test and CI could hit it unannounced.
+    #[tokio::test]
+    async fn a_script_that_never_started_says_nothing_ran() {
+        let _slot = spawn_slot().await;
+        let dir = sandbox("no-spawn");
+        write_script(&dir, "never.sh", "#!/bin/sh\necho 'this never runs'\n");
+
+        SPAWN_FAILURES.store(1, Ordering::Relaxed);
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "never.sh".into(),
+            ..ActionSpec::default()
+        };
+        let outcome = run(&action, &ctx, &dir).await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.stdout, "");
+        assert_eq!(outcome.stderr, "");
+        assert!(outcome.error.is_some(), "{outcome:?}");
+        assert_eq!(outcome.failure_line(), "action failed");
+        // Nothing left armed for the next test in this process to inherit.
+        assert_eq!(SPAWN_FAILURES.load(Ordering::Relaxed), 0);
+    }
+
+    /// The other way to reach the same line: the verb entry names a variable that
+    /// is not set, so the action is refused before anything is forked.
+    ///
+    /// `env_clear()` means the child would not have had the variable either, which
+    /// is why a missing one is a config error rather than a script that has to
+    /// cope. The name cannot be set in the test environment either, asserted
+    /// below so that stays true.
+    #[tokio::test]
+    async fn a_missing_allowlisted_variable_stops_the_action_before_it_spawns() {
+        let _slot = spawn_slot().await;
+        let dir = sandbox("no-env");
+        write_script(&dir, "ok.sh", "#!/bin/sh\necho armed\n");
+        assert!(std::env::var("MESHBOT_TEST_ABSENT").is_err());
+
+        let ctx = parse::parse("alarm arm").unwrap();
+        let action = ActionSpec {
+            script: "ok.sh".into(),
+            env: vec!["MESHBOT_TEST_ABSENT".into()],
+            ..ActionSpec::default()
+        };
+        let outcome = run(&action, &ctx, &dir).await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.stdout, "");
+        assert!(outcome.error.is_some(), "{outcome:?}");
+        assert_eq!(outcome.failure_line(), "action failed");
     }
 
     /// The reason for draining the pipes by hand rather than with
     /// `wait_with_output`: a timeout used to discard the output along with the
     /// future, which is exactly when a diagnosis is worth having.
+    ///
+    /// The `sleep` is redirected to `/dev/null` so this measures the deadline and
+    /// nothing else. `run` waits for the pipes to reach EOF, and a grandchild that
+    /// inherits them keeps them open after the shell is killed — which is a real
+    /// gap in `run`, recorded in `AGENTS.md`, and a 30-second test rather than a
+    /// one-second one.
     #[tokio::test]
     async fn a_script_killed_at_the_timeout_still_explains_itself() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("slow-fail");
         write_script(
             &dir,
             "slow-fail.sh",
-            "#!/bin/sh\necho 'still polling the task' >&2\nsleep 30\n",
+            "#!/bin/sh\necho 'still polling the task' >&2\nsleep 30 >/dev/null 2>&1\n",
         );
 
         let ctx = parse::parse("alarm arm").unwrap();
@@ -690,6 +827,7 @@ mod tests {
     /// request it would have sent, which must never reach a channel.
     #[tokio::test]
     async fn a_successful_scripts_stderr_stays_off_the_air() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("chatty-ok");
         write_script(
             &dir,
@@ -704,7 +842,7 @@ mod tests {
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
-        assert!(outcome.success);
+        assert!(outcome.success, "{outcome:?}");
         assert_eq!(outcome.stdout, "dry-run: nothing sent\n");
         assert!(outcome.stderr.contains("would POST"));
         // What the caller puts on the air is the success path, so it is stdout.
@@ -714,6 +852,7 @@ mod tests {
     /// A chatty failure cannot eat the frame the failure needs.
     #[tokio::test]
     async fn a_relayed_stderr_line_is_clamped() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("loud-fail");
         write_script(
             &dir,
@@ -726,7 +865,14 @@ mod tests {
             script: "loud-fail.sh".into(),
             ..ActionSpec::default()
         };
-        let reply = run(&action, &ctx, &dir).await.failure_line();
+        let reply = {
+            let outcome = run(&action, &ctx, &dir).await;
+            assert!(
+                outcome.error.is_none(),
+                "the script did not run: {outcome:?}"
+            );
+            outcome.failure_line()
+        };
         assert!(
             reply.len() <= MAX_STDERR_BYTES,
             "{} bytes: {reply}",
@@ -739,6 +885,7 @@ mod tests {
     /// allowed to fill its pipe and deadlock, and what is kept is the beginning.
     #[tokio::test]
     async fn a_script_that_floods_stderr_does_not_deadlock() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("flood");
         write_script(
             &dir,
@@ -753,14 +900,23 @@ mod tests {
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
+        assert!(
+            outcome.error.is_none(),
+            "the script did not run: {outcome:?}"
+        );
         assert!(!outcome.success);
         assert!(outcome.stderr.len() <= MAX_STDERR_BYTES);
     }
 
+    /// The deadline is real, not the script's own idea of one: `sleep 30` against
+    /// a one-second allowance must come back as a timeout. Its output streams are
+    /// redirected for the same reason as above — EOF, not the deadline, is what
+    /// this test would otherwise be waiting on.
     #[tokio::test]
     async fn a_slow_script_is_killed_at_the_timeout() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("slow");
-        write_script(&dir, "slow.sh", "#!/bin/sh\nsleep 30\n");
+        write_script(&dir, "slow.sh", "#!/bin/sh\nsleep 30 >/dev/null 2>&1\n");
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
@@ -781,6 +937,7 @@ mod tests {
     /// count is capped too, because 200 lines is 200 transmissions.
     #[tokio::test]
     async fn a_very_chatty_script_becomes_a_capped_number_of_frames() {
+        let _slot = spawn_slot().await;
         let dir = sandbox("chatty");
         write_script(
             &dir,
@@ -794,7 +951,7 @@ mod tests {
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
-        assert!(outcome.success);
+        assert!(outcome.success, "{outcome:?}");
 
         let replies = crate::verbs::split_reply(&outcome.stdout);
         assert_eq!(replies.len(), crate::verbs::MAX_REPLIES + 1, "{replies:?}");
