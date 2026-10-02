@@ -102,10 +102,11 @@ gh workflow run ci.yml --ref v0.3.0
 on the ref, so this produces the missing tag from the tagged commit. Do **not**
 work around it by pinning the host to `latest`: that moves on every merge.
 - `meshcore/compose.yaml` pins a **tag**; there is no `build:` anywhere.
-- Runtime config is **host-owned**, mounted read-only from
-  `/data/meshcore/meshbot-rs/{config.yaml,.env}`. Editing config and restarting
-  the container requires no rebuild.
-- `.env` and `config.yaml` are gitignored; only the `.example` files are tracked.
+- Runtime config is **tracked in the meshcore repo** (`mathieu/meshcore`), mounted
+  read-only from the stack directory. Editing `config.yaml` or `scripts/` there
+  and pushing is a reviewed commit and a deploy — it requires no rebuild.
+- `.env` is the one host-owned file, mounted read-only from
+  `/data/meshcore/meshbot-rs/.env`, and stays gitignored in that repo.
 - `latest` moves on **every** merge to `main` and is not a release. The pinned
   tag only moves when a release PR is merged. Those are two separate deploy
   paths; the unpinned one is for testing a change, the pinned one is the host.
@@ -219,21 +220,32 @@ host-mounted `.env`: it searches upward from the current directory, so with
 error, so a wrong `WORKDIR` does not fail startup — it leaves every credential
 missing until an action runs.
 
-The container runs as uid 1000, so everything mounted under
-`/data/meshcore/meshbot-rs` must be **readable by that uid** — which is a
-question of ownership, not of mode:
+**The live config is not in this repo.** `config.example.yaml` and
+`scripts.example/` here are the templates, and this repo's test suite is what
+validates them against each other. The config the bot actually runs is
+`config.yaml` and `scripts/` in `mathieu/meshcore`, version controlled there and
+mounted into the container. Fix a script here, then copy it across; do not edit
+a deployed change in only one of the two repos.
+
+The container runs as uid 1000, so the host-mounted `.env` must be **readable by
+that uid** — which is a question of ownership, not of mode:
 
 ```bash
 sudo chown -R 1000:1000 /data/meshcore/meshbot-rs
 ```
 
-Chown the directory and `0600` is correct, including for `.env`, which holds HA
-and Proxmox tokens. The alternative — leaving the files owned by another uid and
+Chown the directory and `0600` is correct, including for `.env`, which holds HA,
+Komodo and Proxmox tokens. The alternative — leaving the files owned by another uid and
 relaxing them to `0644` — also works, because a bind mount is read by the
 container's uid rather than mapped to it, but it puts a world-readable copy of
 every credential on the host. `scripts.example/README.md` installs the scripts
 `0755`, since the bot executes them directly and they are tracked in a public
 repository, so there is nothing to hide in them.
+
+Only `.env` still needs this treatment. `config.yaml` and `scripts/` arrive from
+the meshcore stack directory as root-owned bind mounts and are world-readable,
+which is correct: they hold no secrets, and the scripts must be executable by
+uid 1000, so their tracked mode is `100755`.
 
 ### First publish, by hand
 A package published to GHCR with `GITHUB_TOKEN` is created **private**, and

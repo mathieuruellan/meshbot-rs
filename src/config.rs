@@ -31,6 +31,14 @@ pub const DEFAULT_CONFIG_PATH: &str = "/data/meshcore/meshbot-rs/config.yaml";
 /// longer than this is silently cut on the way in.
 const CHANNEL_NAME_MAX_BYTES: usize = 31;
 
+/// How many channel slots the radio exposes, and therefore how many the startup
+/// readback covers.
+///
+/// This is the one number both the declaration and the verification depend on: an
+/// index at or past it would be a channel the bot listens on and never checks, so
+/// it is refused at load rather than quietly unverified.
+pub const CHANNEL_SLOTS: u8 = 8;
+
 /// The parsed config, before validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +167,15 @@ fn validate_channels(channels: &BTreeMap<u8, String>) -> Result<Vec<(u8, String)
 
     let mut names: BTreeSet<&str> = BTreeSet::new();
     for (idx, name) in channels {
+        // A channel the startup readback never reaches is a channel nobody
+        // verifies, and the bot will not create it: an out-of-range index is a
+        // config mistake to fix here, not a slot to invent at the radio.
+        ensure!(
+            *idx < CHANNEL_SLOTS,
+            "bot.channels has index {idx}, which is outside the {CHANNEL_SLOTS} slots the radio \
+             exposes; nothing would ever verify it"
+        );
+
         let name = name.trim();
         ensure!(
             !name.is_empty(),
