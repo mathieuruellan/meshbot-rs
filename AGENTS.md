@@ -29,7 +29,7 @@ below — check `src/`.
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 117 unit tests, no radio needed
+cargo test          # 131 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
@@ -304,27 +304,37 @@ on that.
 Before changing any `meshcore-rs` call, read the vendored source rather than
 trusting docs.rs or the README.
 
-## The one hard invariant: never send `SET_CHANNEL`
-`ChannelInfoData` proves `get_channel` is read-only, and the whole channel map in
-`CHANNELS` (`src/main.rs:15`) depends on indices passing through untouched.
+## The one hard invariant: the radio's channel table is read-only
+**mc-webui owns the channel table.** It is configured there, out of band, and this
+service may only read it. There is no code path in this crate that creates,
+renames, empties or removes a channel — and
+`nothing_in_this_crate_writes_the_radio_channel_or_contact_table` (`src/main.rs`)
+fails the build if one appears, because the guarantee is otherwise only a
+convention. The whole channel map now comes from `bot.channels` in `config.yaml`.
 
 - `SET_CHANNEL` is the **only** command that engages the proxy's channel
   virtualizer (`channel_virtualizer.py`), which remaps a client's indices onto
   allocator-chosen physical slots. A `SET_CHANNEL` anywhere in this codebase
   silently invalidates the channel map and can overwrite the radio's real
   channels.
-- Never write channel names or secrets from this service. The radio's channel
-  table is configured out of band (see the `meshcore` repo's AGENTS.md restore
-  procedure), and that table belongs to whoever owns the radio. **A configured
-  channel this service does not use is not clutter to be tidied** — indices 0
-  and 1 exist for the phone app and the family, not for the bot. Leave every
-  slot exactly as you find it; reading is fine, writing never is.
-- If a channel readback mismatches `CHANNELS`, that is `verify_channels()`
-  correctly refusing to run against a radio it does not recognise. Report the
-  mismatch and stop. Do not "fix" it by writing the expected name.
-- `verify_channels()` reads slots `0..8` back at startup and **fails closed** on
-  a name mismatch, so radio re-layout can't silently point rules at the wrong
-  channel. Keep that behaviour; do not soften it to a warning.
+- **A channel mc-webui configured that `bot.channels` does not declare is read
+  once at startup, counted in one log line, and left exactly as it is** — not
+  tidied, not emptied, not "adopted". Indices 0 and 1 exist for the phone app and
+  the family. Reading is fine; writing never is. `slot_verdict()` returns
+  `Unmonitored` for those slots whether or not they hold a channel, so there is no
+  case where a slot we ignore becomes one we correct.
+- Declaring a channel in `config.yaml` is an **assertion that it already exists**,
+  never a request to create it. Two failures stop the run, and neither is fixed by
+  writing to the radio:
+  - the radio reports a different name for a declared index → re-layout, stop
+  - the radio will not report a declared index at all → it is missing from
+    mc-webui, stop and say so
+  A declared index at or past `config::CHANNEL_SLOTS` is refused at load, because
+  the startup readback covers `0..CHANNEL_SLOTS` and nothing beyond it: such a
+  channel would be listened to and never checked.
+- `verify_channels()` reads every slot back at startup and **fails closed**, so
+  radio re-layout can't silently point verbs at the wrong channel. Keep that
+  behaviour; do not soften it to a warning.
 
 ## Known bug to fix before the rule engine: `message_id()` collides
 `ChannelMessage::message_id()` (vendored `src/events.rs:363`) is:
@@ -464,7 +474,15 @@ Recorded so implementation doesn't relitigate them.
 ## Do not
 - **Do not add `SET_CHANNEL`**, or any write to the radio's channel table or
   contact list. This service shares one radio with mc-webui, Home Assistant and a
-  phone app.
+  phone app. The guard test
+  (`nothing_in_this_crate_writes_the_radio_channel_or_contact_table`) fails the
+  build on `.set_channel(`, `.add_contact(`, `.remove_contact(` or
+  `.set_flood_scope(` anywhere in `src/` — if you find yourself needing one,
+  delete the test deliberately in the same commit, not quietly.
+- **Do not have the bot create, rename or tidy a channel**, including one
+  `bot.channels` does not declare and one it declares but the radio has not got.
+  mc-webui sets channels up; this service asserts they are there and stops if they
+  are not.
 - **Do not use `subscribe()`** for message handling — sync callback, see above.
 - **Do not put secrets or real hostnames in any tracked file**, not even in a
   test fixture or a comment. The repo is **public** and its history is

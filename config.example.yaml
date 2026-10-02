@@ -49,8 +49,19 @@ bot:
   # bytes is silently truncated; the loader warns at that boundary and a longer
   # name is a startup error.
   #
+  # The radio's channel table belongs to mc-webui, and this bot may only READ it.
+  # Listing a channel here asserts it already exists; the bot will not create it,
+  # and it stops with an error naming mc-webui if the radio does not report it. A
+  # channel mc-webui has configured that this file omits is read once, counted in
+  # one log line, and left exactly as it is — never tidied, never adopted. Indices
+  # 0 and 1 belong to the phone app and the family.
+  #
+  # Only the first 8 slots (CHANNEL_SLOTS) are read back, so an index at or past
+  # that is refused here rather than listened to and never verified.
+  #
   # Never add a SET_CHANNEL call. That is the one command that engages the
-  # proxy's channel virtualizer, which would remap these indices.
+  # proxy's channel virtualizer, which would remap these indices; a test in
+  # src/main.rs fails the build if one appears.
   channels:
     3: "#admin"
     4: "#homeassistant"

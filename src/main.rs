@@ -17,13 +17,10 @@ mod verbs;
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use meshcore_rs::{EventPayload, EventType, MeshCore};
 use parse::ParseError;
-
-/// How many channel slots to read back when verifying the map.
-const CHANNEL_SLOTS: u8 = 8;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -421,44 +418,98 @@ async fn send(meshcore: &MeshCore, channel_idx: u8, replies: &[String]) {
     }
 }
 
+/// What the startup readback found in one slot.
+#[derive(Debug, PartialEq, Eq)]
+enum Slot {
+    /// A channel this bot listens on, with the name the config expects.
+    Verified,
+    /// Not a channel this bot listens on. Whether or not it holds a channel is the
+    /// radio owner's business, so both cases land here.
+    Unmonitored,
+}
+
+/// Decide what one slot means, given only its readback.
+///
+/// `read` is the name the radio reported, or `None` when `GET_CHANNEL` failed —
+/// which is what an empty slot looks like from here.
+///
+/// The radio's channel table belongs to mc-webui. This bot only ever reads it, so
+/// the asymmetry is the point: a slot we listen on has to be *proven* present and
+/// correctly named, or the run stops; a slot we do not listen on is nobody's
+/// business, whether or not it holds a channel.
+///
+/// Split out of [`verify_channels`] so the policy can be tested with no radio and
+/// no `MeshCore`.
+fn slot_verdict(idx: u8, read: Option<&str>, channels: &[(u8, String)]) -> Result<Slot> {
+    let Some(expected) = channels
+        .iter()
+        .find(|(i, _)| *i == idx)
+        .map(|(_, n)| n.as_str())
+    else {
+        return Ok(Slot::Unmonitored);
+    };
+
+    let Some(name) = read else {
+        bail!(
+            "channel {idx} is declared as {expected:?} but the radio would not report it; \
+             refusing to start — this bot never creates or edits a channel, so set it up in \
+             mc-webui"
+        );
+    };
+    if name != expected {
+        bail!(
+            "channel {idx} is {name:?} but config expects {expected:?}; \
+             the radio layout has drifted — refusing to start"
+        );
+    }
+    Ok(Slot::Verified)
+}
+
 /// Read the radio's channel table back and fail if it disagrees with the config.
 ///
 /// `channels` is the config's `bot.channels`, so the listen set and the startup
 /// assertion are the same declaration: there is no second list to drift.
 ///
-/// Read-only: this issues `GET_CHANNEL` only. `SET_CHANNEL` would be the one
-/// call that puts us in the proxy's virtualizer and remaps indices.
+/// Strictly read-only: this issues `GET_CHANNEL` and nothing else. There is no
+/// `SET_CHANNEL` anywhere in this crate, which is what keeps the bot out of the
+/// proxy's channel virtualizer — the one command that remaps indices onto
+/// allocator-chosen slots, and so would invalidate the map this function checks.
+/// A test at the bottom of this file fails the build if that ever changes.
+///
+/// Every slot is read, including ones `bot.channels` does not name: a channel
+/// mc-webui set up for the phone app or the family is read and left alone, never
+/// tidied away.
 async fn verify_channels(meshcore: &MeshCore, channels: &[(u8, String)]) -> Result<()> {
     let commands = meshcore.commands().lock().await;
+    let mut unmonitored = 0u32;
 
-    for idx in 0..CHANNEL_SLOTS {
-        let info = match commands.get_channel(idx).await {
-            Ok(info) => info,
+    for idx in 0..config::CHANNEL_SLOTS {
+        let read = match commands.get_channel(idx).await {
+            Ok(info) => Some(info.name),
             Err(err) => {
-                // Empty slots are expected to fail or come back blank; only a
-                // slot we actually care about is a hard failure.
-                tracing::debug!(channel_idx = idx, %err, "no channel in slot");
-                continue;
+                tracing::debug!(channel_idx = idx, %err, "slot holds no channel");
+                None
             }
         };
 
-        let expected = channels
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .map(|(_, n)| n.as_str());
-        match expected {
-            Some(name) if info.name == name => {
-                tracing::info!(channel_idx = idx, name = %info.name, "channel verified");
+        match slot_verdict(idx, read.as_deref(), channels)? {
+            Slot::Verified => {
+                let name = read.expect("a verified slot was read");
+                tracing::info!(channel_idx = idx, %name, "channel verified");
             }
-            Some(name) => {
-                anyhow::bail!(
-                    "channel {idx} is {:?} but config expects {name:?}; \
-                     the radio layout has drifted — refusing to start",
-                    info.name
-                );
+            Slot::Unmonitored => {
+                if read.is_some() {
+                    unmonitored += 1;
+                }
             }
-            None => tracing::info!(channel_idx = idx, name = %info.name, "unmonitored channel"),
         }
+    }
+
+    if unmonitored > 0 {
+        tracing::info!(
+            unmonitored,
+            "channels this bot does not listen on; read only, left as they are"
+        );
     }
 
     Ok(())
@@ -745,6 +796,106 @@ mod tests {
         // 2024-01-01, so a machine with no clock at all fails visibly rather
         // than quietly syncing the radio to 1970.
         assert!(now_secs() > 1_704_067_200, "{}", now_secs());
+    }
+
+    // ---- the channel table is read-only
+
+    fn listen_set() -> Vec<(u8, String)> {
+        vec![(2, "#admin".to_string()), (3, "#homeassistant".to_string())]
+    }
+
+    /// The declared channels have to be there, with the name the config expects.
+    #[test]
+    fn a_declared_channel_that_reads_back_correctly_is_verified() {
+        let channels = listen_set();
+        for (idx, name) in &channels {
+            assert_eq!(
+                slot_verdict(*idx, Some(name), &channels).unwrap(),
+                Slot::Verified
+            );
+        }
+    }
+
+    /// A renamed channel is a radio re-layout, not something to correct. Writing
+    /// the expected name back is exactly the write this bot must never make.
+    #[test]
+    fn a_declared_channel_with_the_wrong_name_is_fatal() {
+        let err = slot_verdict(2, Some("#family"), &listen_set())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("#family"), "{err}");
+        assert!(err.contains("refusing to start"), "{err}");
+    }
+
+    /// The new fail-closed rule: a channel we listen on that the radio will not
+    /// report stops the run. It used to be skipped, which left the bot listening on
+    /// a slot it never checked.
+    #[test]
+    fn a_declared_channel_the_radio_will_not_report_is_fatal() {
+        let err = slot_verdict(2, None, &listen_set())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would not report it"), "{err}");
+        // The message has to say where the fix belongs, because the bot will not do it.
+        assert!(err.contains("mc-webui"), "{err}");
+    }
+
+    /// The other half of the invariant: a channel mc-webui configured that this
+    /// config does not name is read once and left alone, whether or not it exists.
+    #[test]
+    fn an_undeclared_channel_is_left_alone() {
+        let channels = listen_set();
+        assert_eq!(
+            slot_verdict(0, Some("#family"), &channels).unwrap(),
+            Slot::Unmonitored
+        );
+        assert_eq!(slot_verdict(7, None, &channels).unwrap(), Slot::Unmonitored);
+    }
+
+    /// The whole hard invariant, checked against the source rather than trusted:
+    /// the radio's channel and contact tables are shared with mc-webui, the phone
+    /// app and the family, and this bot may only read them.
+    ///
+    /// `SET_CHANNEL` is the command that would engage the proxy's channel
+    /// virtualizer and remap indices onto physical slots — which is not a bug in
+    /// this service's own map, but an overwrite of somebody else's channels. It
+    /// is one method call away at any time, and nothing about it fails to compile
+    /// or to test, so the guarantee has to be mechanical.
+    ///
+    /// The needles are assembled at runtime so this test does not match itself, and
+    /// each keeps its leading dot so prose about these calls in a comment or a doc
+    /// line is not mistaken for one. Each is `.` + `prefix` + `_` + `method` + `(`:
+    /// a needle that misses one of those parts silently matches nothing, which is
+    /// the shape of a guard that looks like it works and does not.
+    #[test]
+    fn nothing_in_this_crate_writes_the_radio_channel_or_contact_table() {
+        const FORBIDDEN: [(&str, &str); 4] = [
+            ("set", "channel"),
+            ("add", "contact"),
+            ("remove", "contact"),
+            ("set", "flood_scope"),
+        ];
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&src).expect("src/ is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable source file");
+            checked += 1;
+            for (prefix, method) in FORBIDDEN {
+                let needle = format!(".{prefix}_{method}(");
+                assert!(
+                    !text.contains(&needle),
+                    "{} calls {prefix}_{method}() — the radio's channel table belongs to \
+                     mc-webui and is read-only to this bot",
+                    path.display()
+                );
+            }
+        }
+        assert!(checked >= 6, "only scanned {checked} files in src/");
     }
 
     // ---- reply rendering

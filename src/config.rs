@@ -374,6 +374,17 @@ mod tests {
         )
     }
 
+    /// As [`config`], with the channel declared at one index instead of two, for
+    /// the rules that are about the index rather than the name.
+    fn config_at(idx: u8, verbs: &str) -> Result<Loaded> {
+        from_yaml(
+            &format!(
+                "schema: 1\nbot:\n  channels: {{{idx}: admin}}\n  script_dir: /unused\nverbs:\n{verbs}"
+            ),
+            &scripts(),
+        )
+    }
+
     #[test]
     fn accepts_a_minimal_valid_config() {
         let loaded = config(
@@ -517,6 +528,28 @@ mod tests {
         let raw = "schema: 1\nbot:\n  channels: {2: admin, 3: admin}\n  script_dir: /unused\nverbs:\n  - name: garage\n    channel: admin\n    get:\n      script: ok.sh\n      reply: a\n";
         let err = from_yaml(raw, &scripts()).unwrap_err().to_string();
         assert!(err.contains("twice"), "{err}");
+    }
+
+    /// The startup readback covers slots `0..CHANNEL_SLOTS` and nothing else, so a
+    /// higher index would be a channel the bot listens on and never checks. The
+    /// radio table belongs to mc-webui: the fix is to declare the real index, not
+    /// for the bot to bring a slot into being.
+    #[test]
+    fn an_index_the_startup_readback_cannot_reach_is_fatal() {
+        let err = config_at(
+            9,
+            "  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("outside the 8 slots"), "{err}");
+
+        // The last slot the readback does reach is fine.
+        assert!(config_at(
+            CHANNEL_SLOTS - 1,
+            "  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+        )
+        .is_ok());
     }
 
     /// The directory handed back must be the one the scripts were checked in.
