@@ -303,7 +303,13 @@ trusting docs.rs or the README.
   channels.
 - Never write channel names or secrets from this service. The radio's channel
   table is configured out of band (see the `meshcore` repo's AGENTS.md restore
-  procedure).
+  procedure), and that table belongs to whoever owns the radio. **A configured
+  channel this service does not use is not clutter to be tidied** — indices 0
+  and 1 exist for the phone app and the family, not for the bot. Leave every
+  slot exactly as you find it; reading is fine, writing never is.
+- If a channel readback mismatches `CHANNELS`, that is `verify_channels()`
+  correctly refusing to run against a radio it does not recognise. Report the
+  mismatch and stop. Do not "fix" it by writing the expected name.
 - `verify_channels()` reads slots `0..8` back at startup and **fails closed** on
   a name mismatch, so radio re-layout can't silently point rules at the wrong
   channel. Keep that behaviour; do not soften it to a warning.
