@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.4.0...v0.4.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* make the radio channel table strictly read-only ([8646cf0](https://github.com/mathieuruellan/meshbot-rs/commit/8646cf08a760cc1eba8ac79ad4424de22622df01))
+* serialise the script tests and make a failed fork visible ([3f5aa9c](https://github.com/mathieuruellan/meshbot-rs/commit/3f5aa9c42cacfad39980a767e35da3e142585dda))
+
 ## [0.4.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.3.0...v0.4.0) (2026-10-01)
 
 
