@@ -226,6 +226,57 @@ impl Context {
     }
 }
 
+/// The marker that distinguishes a command from ordinary chat.
+///
+/// Without it, every message that merely *contains* a verb would run it:
+/// `see you: komodo` in a sentence is indistinguishable from an addressed
+/// command once the sender tag is removed, and these channels are family
+/// conversations rather than a dedicated command channel. Requiring an
+/// explicit marker makes that impossible rather than unlikely.
+pub const COMMAND_MARKER: char = '!';
+
+/// Strip one sender tag, returning the body.
+///
+/// Apps prepend the sender's identity to channel text — the MeshCore Open app
+/// sends `✊44NTE-Tico-WTag: komodo`, where `✊` is the sender's chosen symbol
+/// and the rest is their node name. `ChannelMessage` carries no sender field
+/// (only `channel_idx`, `path_len`, `txt_type`, `sender_timestamp`, `text`,
+/// `snr`), so the tag cannot be verified out of band; it is only ever a
+/// convention.
+///
+/// It is matched loosely on purpose: everything up to the first `": "`. Since
+/// [`COMMAND_MARKER`] is what actually authorises a command, guessing the tag's
+/// shape correctly buys no safety, and a permissive rule keeps working for
+/// clients whose tag format we have never seen. A client that sends no tag at
+/// all is handled by the `None` arm and passes through unchanged.
+pub fn sender_body(text: &str) -> &str {
+    // Only strip a leading sender tag if it looks like one: a single token at
+    // the start, no leading '!' (so we don't confuse "!hey" as a node name),
+    // short, and followed by ": ". This keeps bare `!hey: komodo` intact.
+    match text.find(": ") {
+        Some(i) if i > 0 => {
+            let prefix = &text[..i];
+            if prefix.starts_with(COMMAND_MARKER) {
+                text
+            } else if prefix.contains(' ') || prefix.len() > 32 {
+                text
+            } else {
+                &text[i + 2..]
+            }
+        }
+        _ => text,
+    }
+}
+
+/// The command text of a message, or `None` when it is not addressed as one.
+///
+/// The marker is required. This is what makes channel messages usable at all:
+/// without stripping the sender tag first, every real message fails the
+/// grammar's `SOI ~ verb` at its very first character.
+pub fn command_text(text: &str) -> Option<&str> {
+    sender_body(text).strip_prefix(COMMAND_MARKER).map(|s| s.trim_start())
+}
+
 /// Parse with no extra reserved keys. Test shorthand for [`parse_with`].
 #[cfg(test)]
 pub fn parse(input: &str) -> Result<Context, ParseError> {
@@ -528,6 +579,42 @@ mod tests {
     fn a_keyword_prefix_is_a_word_not_a_partial_keyword() {
         let ctx = parse("v b=truely").unwrap();
         assert_eq!(ctx.get("b"), Some(&word("truely")));
+    }
+
+    #[test]
+    fn command_text_strips_sender_tag_and_marker() {
+        let msg = "✊44NTE-Tico-WTag: !komodo";
+        let body = sender_body(msg);
+        assert_eq!(body, "!komodo");
+        assert_eq!(command_text(msg), Some("komodo"));
+    }
+
+    #[test]
+    fn command_text_accepts_a_plain_nickname_tag() {
+        // No app symbol, and uppercase: the heuristic keys on neither, it only
+        // asks whether the prefix looks like a tag. This is the common shape.
+        let msg = "NICKNAME: !komodo";
+        assert_eq!(sender_body(msg), "!komodo");
+        assert_eq!(command_text(msg), Some("komodo"));
+    }
+
+    #[test]
+    fn command_text_accepts_bare_marker() {
+        assert_eq!(command_text("!komodo"), Some("komodo"));
+        assert_eq!(command_text("! internet ok"), Some("internet ok"));
+    }
+
+    #[test]
+    fn command_text_no_marker_means_not_addressed() {
+        assert_eq!(command_text("komodo"), None);
+        assert_eq!(command_text("✊me: komodo"), None);
+    }
+
+    #[test]
+    fn command_text_does_not_double_strip() {
+        // If someone includes ': ' after the body, it is left alone.
+        assert_eq!(command_text("✊me: !hey: komodo"), Some("hey: komodo"));
+        assert_eq!(command_text("!hey: komodo"), Some("hey: komodo"));
     }
 
     #[test]

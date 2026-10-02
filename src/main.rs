@@ -159,11 +159,30 @@ fn decide<'a>(
     table: &'a verbs::VerbTable,
     reserved: &parse::Reserved,
     latch: &mut latch::Latch,
-    text: &str,
+    raw: &str,
     channel: &str,
     channel_idx: u8,
 ) -> Decision<'a> {
-    let mut ctx = match parse::parse_with(text, reserved) {
+    // The marker decides whether this is a command at all. Everything below
+    // works on the text *after* it, never on the raw message, so the sender tag
+    // and the marker cannot leak into a verb name or an argument.
+    let Some(command) = parse::command_text(raw) else {
+        let body = parse::sender_body(raw);
+        return if parse::parse_with(body, reserved).is_ok() {
+            // Addressed to us and spelled correctly, but missing the marker. Say
+            // so rather than staying silent: silence is indistinguishable from
+            // the bot being down, which is how a genuine outage presents too.
+            tracing::info!(channel_idx, "command without marker");
+            Decision::Reply(format!("commands start with '{}'", parse::COMMAND_MARKER))
+        } else {
+            // Ordinary chat. Debug, not info: these channels are busy, and an
+            // info line per message would bury the ones that matter.
+            tracing::debug!(channel_idx, "not addressed as a command");
+            Decision::Ignore
+        };
+    };
+
+    let mut ctx = match parse::parse_with(command, reserved) {
         Ok(ctx) => ctx,
         Err(err) => {
             // Not a command, so no reply: these channels are not exclusively
@@ -223,7 +242,14 @@ fn decide<'a>(
                     // The prompt echoes what was typed, not the canonical
                     // spelling: prompting `reboot alpha ok` after `reboot
                     // delta` would confirm a different machine.
-                    return Decision::Reply(format!("confirm: '{}'", verbs::confirm_text(text)));
+                    //
+                    // `command`, not `text`: the raw message still carries the
+                    // sender tag and the marker, and echoing those would ask
+                    // the user to confirm a string that can never parse.
+                    return Decision::Reply(format!(
+                        "confirm: '{}'",
+                        verbs::confirm_text(command)
+                    ));
                 }
                 if !latch.take(&ctx.canonical()) {
                     // Expired, never armed, or a different key. Answer, and do
