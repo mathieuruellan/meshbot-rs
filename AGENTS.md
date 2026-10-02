@@ -21,15 +21,16 @@ replies on the air — one message per line of the reply. The config loader
 (`src/config.rs`) is implemented too, so `config.example.yaml` is the real schema
 and is validated by the test suite; the verb table, the channel map and the script
 directory all come from `config.yaml`. It also owns the radio clock
-(`set_radio_clock`). Do not assume a feature exists because it is described
-below — check `src/`.
+(`set_radio_clock`) and polls the radio for liveness, redialling when it stops
+answering (`run_connection` / `radio_is_alive`). Do not assume a feature exists
+because it is described below — check `src/`.
 
 ## Build
 ```bash
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 133 unit tests, no radio needed
+cargo test          # 139 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
@@ -118,10 +119,11 @@ work around it by pinning the host to `latest`: that moves on every merge.
   paths; the unpinned one is for testing a change, the pinned one is the host.
 
 ## The radio clock
-The bot owns it. `set_radio_clock()` runs on every successful connect, reads the
-device time with `GET_DEVICE_TIME`, and writes `SET_DEVICE_TIME` **only when the
-radio is behind the container clock** by more than 60s. A device that is ahead
-was set by hand, and overwriting it would be the regression rather than the fix.
+The bot owns it. `set_radio_clock()` runs on every successful **(re)connect**,
+reads the device time with `GET_DEVICE_TIME`, and writes `SET_DEVICE_TIME` **only
+when the radio is behind the container clock** by more than 60s. A device that is
+ahead was set by hand, and overwriting it would be the regression rather than the
+fix.
 
 The radio keeps no clock worth trusting: it loses time when powered down, and
 that is what makes this a startup step rather than a nicety. A failure to read
@@ -131,21 +133,32 @@ a time query must not stop the bot from answering messages.
 Verify from the logs, never from the exit code:
 
 ```bash
-docker logs meshcore-bot-rs 2>&1 | grep -E "Device time|Radio clock updated"
+docker logs meshcore-bot-rs 2>&1 | grep -E "Device time|Radio clock updated|connection lost"
 ```
 
 `Device time: N, System time: M` must appear, followed by exactly one of
 `Radio clock updated to: N` or `Device time is current or ahead - no update
 needed`. Neither means the bot never reached the radio.
 
-**Known gap: a radio power-cycle does not re-sync.** The proxy keeps client
-sockets open when the radio disconnects — it flips an internal flag, drops
-commands with `Command dropped: radio not connected`, and reconnects the serial
-port itself — so no TCP connection is broken and nothing re-enters
-`set_radio_clock()`. The clock is stale until the bot restarts. This pre-dates
-this bot (the removed `clock-sync` service had the same gap, since it only ever
-ran at `docker compose up`). Closing it needs a liveness probe on the bot that
-restarts the container after a radio outage.
+**A radio power-cycle re-syncs.** The proxy keeps client sockets open when the
+radio disconnects — it flips an internal flag, drops commands with `Command
+dropped: radio not connected`, and reconnects the serial port itself — so no TCP
+connection is broken and nothing re-enters `set_radio_clock()` on its own. The
+bot therefore polls the radio: `run_connection()` runs a read-only
+`GET_DEVICE_TIME` every `PROBE_INTERVAL` (60s), and a probe that fails ends the
+connection. `main()` redials after `RECONNECT_DELAY` (5s), and a fresh connect
+re-runs `set_radio_clock()`. The clock is therefore stale for at most about a
+probe interval, not until the next restart.
+
+This is in-process, not a container restart: `main()` loops over
+`run_connection()` and reconnects on any transport or radio failure. A
+`verify_channels()` disagreement is the one exception — it is returned as
+`Ended::Fatal`, because a radio layout that does not match `config.yaml` is not
+something a redial can fix.
+
+The latch is created **per connection**, so a reconnect disarms every pending
+confirmation. A two-step action armed before a radio outage must be re-issued
+after it.
 
 **Known gap: a backgrounded script holds the reply past its own deadline.**
 `script::run` kills the child at `timeout_secs`, then drains both pipes to EOF

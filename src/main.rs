@@ -22,6 +22,17 @@ use futures::StreamExt;
 use meshcore_rs::{EventPayload, EventType, MeshCore};
 use parse::ParseError;
 
+/// How long to wait between read-only liveness probes of the radio.
+///
+/// The proxy keeps a client's TCP socket open when the radio disconnects — it
+/// flips an internal flag and drops commands — so there is no disconnect to
+/// react to. Liveness has to be polled. The probe is a `GET_DEVICE_TIME`, which
+/// is read-only and touches no table this bot shares with mc-webui.
+const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long to wait before redialling after a connection ends.
+const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -43,7 +54,6 @@ async fn main() -> Result<()> {
         script_dir = %loaded.script_dir.display(),
         "config loaded"
     );
-    let script_dir = &loaded.script_dir;
 
     let host = std::env::var("MESHCORE_HOST").unwrap_or_else(|_| "proxy".to_string());
     let port: u16 = std::env::var("MESHCORE_PORT")
@@ -53,17 +63,51 @@ async fn main() -> Result<()> {
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), host = %host, port, "starting");
 
-    let meshcore = MeshCore::tcp(&host, port)
-        .await
-        .with_context(|| format!("cannot connect to {host}:{port}"))?;
+    // The connection is not expected to last: the radio can be power-cycled and
+    // the proxy restarted under it. Every connection re-runs the clock sync and
+    // the channel assertion, so recovery is a reconnect, not a container restart.
+    loop {
+        match run_connection(&host, port, &loaded).await {
+            Ended::Reconnect(err) => {
+                tracing::warn!(%err, delay = ?RECONNECT_DELAY, "connection lost; reconnecting");
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+            Ended::Fatal(err) => return Err(err),
+        }
+    }
+}
 
-    let info = meshcore
-        .commands()
-        .lock()
-        .await
-        .send_appstart()
-        .await
-        .context("send_appstart failed")?;
+/// Why a connection ended.
+///
+/// The distinction matters: a transport or radio failure is worth redialling,
+/// but a config/radio-layout disagreement is not — no amount of reconnecting
+/// changes what `config.yaml` asserts the radio should hold.
+enum Ended {
+    /// The transport or the radio failed. Reconnect.
+    Reconnect(anyhow::Error),
+    /// The config and the radio disagree. Stop, as the startup assertion always has.
+    Fatal(anyhow::Error),
+}
+
+/// One connection, from dial to the moment it is no longer usable.
+///
+/// Returns rather than loops so the reconnect policy lives in one place in
+/// [`main`]. The latch is created here, per connection, so a reconnect disarms
+/// any pending confirmation: a two-step action must be re-issued against the
+/// connection that armed it.
+async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended {
+    let meshcore = match MeshCore::tcp(host, port).await {
+        Ok(meshcore) => meshcore,
+        Err(err) => return Ended::Reconnect(err.into()),
+    };
+
+    let info = match meshcore.commands().lock().await.send_appstart().await {
+        Ok(info) => info,
+        Err(err) => {
+            disconnect(&meshcore).await;
+            return Ended::Reconnect(err.into());
+        }
+    };
     tracing::info!(name = %info.name, "app started");
 
     // Time first, so a channel message the radio sends after connecting
@@ -71,51 +115,104 @@ async fn main() -> Result<()> {
     // a failure to query or set the clock does not stop the bot.
     set_radio_clock(&meshcore).await;
 
-    verify_channels(&meshcore, &loaded.channels).await?;
+    if let Err(err) = verify_channels(&meshcore, &loaded.channels).await {
+        disconnect(&meshcore).await;
+        return Ended::Fatal(err);
+    }
 
     // Returns unit, not a Result — there is nothing to await that can fail.
     meshcore.start_auto_message_fetching().await;
     tracing::info!("listening for channel messages");
 
+    let script_dir = &loaded.script_dir;
     let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-
     let mut stream = meshcore.event_stream_filtered(EventType::ChannelMsgRecv);
-    while let Some(event) = stream.next().await {
-        if let EventPayload::ChannelMessage(msg) = event.payload {
-            let Some((_, name)) = loaded
-                .channels
-                .iter()
-                .find(|(idx, _)| *idx == msg.channel_idx)
-            else {
-                // Not in the listen set. The channel map is both the filter and
-                // the startup assertion, so a message from anywhere else is
-                // dropped before it is even parsed.
-                tracing::debug!(channel_idx = msg.channel_idx, "channel not monitored");
-                continue;
-            };
-            tracing::info!(
-                channel_idx = msg.channel_idx,
-                message_id = msg.message_id(),
-                text = %msg.text,
-                "channel message"
-            );
-            // Sequential, deliberately. One message is resolved, executed and
-            // answered before the next is read, so two actions cannot interleave
-            // their scripts or their replies.
-            handle_message(
-                &meshcore,
-                &loaded,
-                &mut latch,
-                script_dir,
-                &msg.text,
-                name,
-                msg.channel_idx,
-            )
-            .await;
+
+    // `interval` fires immediately on its first tick; consume it so the first
+    // probe is one interval out rather than at connect time. `Delay` keeps a
+    // long-running action from making the next probes fire in a burst.
+    let mut probe = tokio::time::interval(PROBE_INTERVAL);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    probe.tick().await;
+
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                let Some(event) = event else {
+                    // The stream ends only when its sender is gone, which is the
+                    // transport being unusable.
+                    disconnect(&meshcore).await;
+                    return Ended::Reconnect(anyhow::anyhow!("channel event stream ended"));
+                };
+                if let EventPayload::ChannelMessage(msg) = event.payload {
+                    let Some((_, name)) = loaded
+                        .channels
+                        .iter()
+                        .find(|(idx, _)| *idx == msg.channel_idx)
+                    else {
+                        // Not in the listen set. The channel map is both the filter and
+                        // the startup assertion, so a message from anywhere else is
+                        // dropped before it is even parsed.
+                        tracing::debug!(channel_idx = msg.channel_idx, "channel not monitored");
+                        continue;
+                    };
+                    tracing::info!(
+                        channel_idx = msg.channel_idx,
+                        message_id = msg.message_id(),
+                        text = %msg.text,
+                        "channel message"
+                    );
+                    // Sequential, deliberately. One message is resolved, executed and
+                    // answered before the next is read, so two actions cannot interleave
+                    // their scripts or their replies.
+                    handle_message(
+                        &meshcore,
+                        loaded,
+                        &mut latch,
+                        script_dir,
+                        &msg.text,
+                        name,
+                        msg.channel_idx,
+                    )
+                    .await;
+                }
+            }
+            _ = probe.tick() => {
+                if let Err(err) = radio_is_alive(&meshcore).await {
+                    // The proxy kept the socket open and dropped the command, so
+                    // this is the only signal that the radio is gone. Redialling is
+                    // what re-runs set_radio_clock().
+                    disconnect(&meshcore).await;
+                    return Ended::Reconnect(err);
+                }
+                tracing::debug!("radio liveness probe ok");
+            }
         }
     }
+}
 
+/// Ask the radio for its clock as a liveness check.
+///
+/// Read-only on purpose: `GET_DEVICE_TIME` touches no table this bot shares
+/// with mc-webui, and a failure here means the proxy is dropping commands
+/// because the radio is not connected.
+async fn radio_is_alive(meshcore: &MeshCore) -> Result<()> {
+    let commands = meshcore.commands().lock().await;
+    commands
+        .get_time()
+        .await
+        .context("radio did not answer GET_DEVICE_TIME")?;
     Ok(())
+}
+
+/// Drop the background tasks before the client goes away.
+///
+/// `MeshCore` has no `Drop` that aborts its read/write tasks, so a client that
+/// is replaced without this leaves them running until the process exits.
+async fn disconnect(meshcore: &MeshCore) {
+    if let Err(err) = meshcore.disconnect().await {
+        tracing::warn!(%err, "disconnect failed");
+    }
 }
 
 /// What a message should cause.
@@ -320,9 +417,9 @@ fn now_secs() -> u32 {
 ///
 /// Note the companion radio sits behind the proxy, which keeps client sockets
 /// open across a radio disconnect and reconnects the port itself. Nothing
-/// breaks the TCP connection, so nothing re-enters this function: a radio
-/// power-cycle leaves the clock stale until the bot restarts. That is a real
-/// gap, and it is the reason the deployment needs a liveness probe.
+/// breaks the TCP connection, so this function cannot rely on a disconnect to
+/// be re-entered. [`run_connection`] polls the radio and redials when it stops
+/// answering, which is what brings the run back here after a power-cycle.
 async fn set_radio_clock(meshcore: &MeshCore) {
     let now = now_secs();
     // One lock for both commands: there is no await between the read and the
