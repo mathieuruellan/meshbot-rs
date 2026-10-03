@@ -538,7 +538,8 @@ Recorded so implementation doesn't relitigate them.
   values the verb table declares. `${ENV}` is not expanded either — `.env` is
   read verbatim, so a script reads a value from the environment via `env:`
   instead. A reply may also read the message metadata the engine injects:
-  `{{hops}}`, `{{delay}}`, `{{snr}}`, `{{sender_timestamp}}` and `{{repeaters}}`.
+  `{{sender}}`, `{{hops}}`, `{{delay}}`, `{{snr}}`, `{{sender_timestamp}}` and
+  `{{repeaters}}`.
 - **Reply-only actions**: `script` is optional. With no script the action runs
   nothing and succeeds, rendering its `reply` from the context alone; the loader
   refuses `{{stdout}}` there, because no process could fill it. `ping` is the
@@ -559,6 +560,14 @@ Recorded so implementation doesn't relitigate them.
   path byte correctly in `parse_mesh_packet_header` (the RF log) but exposes the
   raw byte on `ChannelMessage`, so a zero-hop message arrives as `0x40` (64). If
   a future crate release decodes it, remove the mask here and the upstream issue.
+- **Sender tag**: apps prepend `<symbol><name>: ` to channel text. It is not a
+  packet field (`ChannelMessage` has none), so it is read from the raw text.
+  `command_text` anchors on the marker after the first `": "`, so a multi-word
+  sender name (`✊FR44TRIG-c14 fixe: !ping`) is accepted, while a chat sentence
+  with no marker (`see you: ping`) is not. `sender_nickname` returns the tag
+  **verbatim** — no symbol stripping, no case change — and `decide` injects it as
+  `sender`, defaulting to `?` when a client sends no tag, so a reply can always
+  name the sender and never fails to expand. `sender` is reserved.
 - **Replies**: a successful action produces **one message per line** of its
   rendered reply, capped at `MAX_REPLIES` (4) plus a `+N more` line — so a script
   listing eleven things never becomes eleven transmissions. A single line that

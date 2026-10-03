@@ -459,6 +459,13 @@ fn decide<'a>(
         }
     };
     verbs::with_system(&mut ctx, channel, channel_idx, meta);
+    // The sender tag is a convention, not a packet field, so it is read from the
+    // raw text and injected verbatim. `?` when a client sends no tag at all, so
+    // a reply template can always name the sender.
+    ctx.set_system(
+        "sender",
+        parse::Value::Str(parse::sender_nickname(raw).unwrap_or("?").to_string()),
+    );
 
     if ctx.is_poisoned("channel") || ctx.is_poisoned("channel_idx") {
         // A relayed message tried to claim a different channel than the one it
@@ -1522,6 +1529,37 @@ mod tests {
         assert_eq!(
             only(render(&action, &ctx, &outcome)),
             "ping: 12s, 3 hops | A > B > C"
+        );
+    }
+
+    /// A command's sender tag is injected verbatim, so a reply can name them.
+    #[test]
+    fn a_command_context_carries_the_senders_nickname() {
+        let table = table();
+        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let Decision::Execute { ctx, .. } =
+            run_raw(table, &mut latch, "✊FR44TRIG-c14 fixe: !ping", ADMIN)
+        else {
+            panic!("expected Execute");
+        };
+        assert_eq!(
+            ctx.get("sender").map(ToString::to_string),
+            Some("✊FR44TRIG-c14 fixe".to_string())
+        );
+    }
+
+    /// A client that sends no tag still gets `sender`, so a reply template can
+    /// always name it and never fails to expand.
+    #[test]
+    fn a_bare_command_gets_the_sender_placeholder() {
+        let table = table();
+        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let Decision::Execute { ctx, .. } = run_raw(table, &mut latch, "!ping", ADMIN) else {
+            panic!("expected Execute");
+        };
+        assert_eq!(
+            ctx.get("sender").map(ToString::to_string),
+            Some("?".to_string())
         );
     }
 }

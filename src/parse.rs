@@ -43,6 +43,7 @@ pub const RESERVED_KEYS: &[&str] = &[
     "hops",
     "delay",
     "repeaters",
+    "sender",
     "status",
     "stdout",
     "target",
@@ -261,7 +262,7 @@ impl Context {
 /// explicit marker makes that impossible rather than unlikely.
 pub const COMMAND_MARKER: char = '!';
 
-/// Strip one sender tag, returning the body.
+/// Strip one sender tag, returning the body, for the missing-marker reply.
 ///
 /// Apps prepend the sender's identity to channel text — the MeshCore Open app
 /// sends `✊44NTE-Tico-WTag: komodo`, where `✊` is the sender's chosen symbol
@@ -270,11 +271,12 @@ pub const COMMAND_MARKER: char = '!';
 /// `snr`), so the tag cannot be verified out of band; it is only ever a
 /// convention.
 ///
-/// It is matched loosely on purpose: everything up to the first `": "`. Since
-/// [`COMMAND_MARKER`] is what actually authorises a command, guessing the tag's
-/// shape correctly buys no safety, and a permissive rule keeps working for
-/// clients whose tag format we have never seen. A client that sends no tag at
-/// all is handled by the `None` arm and passes through unchanged.
+/// [`command_text`] no longer uses this: it anchors on the marker, so a
+/// multi-word sender name is handled. This is only for `decide`'s "commands
+/// start with '!'" nicety, where there is no marker to anchor on, and it stays
+/// deliberately conservative — one short token before the first `": "`, no
+/// leading marker, no spaces — so an ordinary sentence like `see you: ping` is
+/// not stripped and does not earn a spurious reply.
 pub fn sender_body(text: &str) -> &str {
     // Only strip a leading sender tag if it looks like one: a single token at
     // the start, no leading '!' (so we don't confuse "!hey" as a node name),
@@ -294,13 +296,38 @@ pub fn sender_body(text: &str) -> &str {
 
 /// The command text of a message, or `None` when it is not addressed as one.
 ///
-/// The marker is required. This is what makes channel messages usable at all:
-/// without stripping the sender tag first, every real message fails the
-/// grammar's `SOI ~ verb` at its very first character.
+/// The marker is what authorises a command. It is either at the very start of
+/// the message, or it follows a sender tag of the form `<tag>: `. The tag is
+/// free text — sender names may contain spaces and symbols and be any length —
+/// so it is found by its terminator (the first `": "`), never by guessing its
+/// shape. Requiring the marker after that boundary is what keeps a chat sentence
+/// like `see you: ping` from being treated as a command.
 pub fn command_text(text: &str) -> Option<&str> {
-    sender_body(text)
+    if let Some(rest) = text.strip_prefix(COMMAND_MARKER) {
+        return Some(rest.trim_start());
+    }
+    let i = text.find(": ")?;
+    text[i + 2..]
+        .trim_start()
         .strip_prefix(COMMAND_MARKER)
-        .map(|s| s.trim_start())
+        .map(str::trim_start)
+}
+
+/// The sender's nickname, exactly as the app wrote it, or `None` when the
+/// message carries no tag.
+///
+/// The tag is everything before the first `": "` — the app's `<symbol><name>`
+/// prefix — returned **verbatim**, only trimmed of surrounding whitespace. It is
+/// deliberately not reshaped (no symbol stripped, no case change): a reply that
+/// names the sender must quote the name they chose. `None` when the message
+/// starts with the command marker, i.e. a client that prepends no tag.
+pub fn sender_nickname(text: &str) -> Option<&str> {
+    if text.starts_with(COMMAND_MARKER) {
+        return None;
+    }
+    let i = text.find(": ")?;
+    let nickname = text[..i].trim();
+    (!nickname.is_empty()).then_some(nickname)
 }
 
 /// Parse with no extra reserved keys. Test shorthand for [`parse_with`].
@@ -641,6 +668,44 @@ mod tests {
         // If someone includes ': ' after the body, it is left alone.
         assert_eq!(command_text("✊me: !hey: komodo"), Some("hey: komodo"));
         assert_eq!(command_text("!hey: komodo"), Some("hey: komodo"));
+    }
+
+    /// A sender name may contain spaces, so `command_text` anchors on the marker
+    /// after the tag's `": "` terminator rather than guessing the tag's shape.
+    /// This is the `FR44TRIG-c14 fixe: !ping` case that used to be ignored.
+    #[test]
+    fn command_text_strips_a_multi_word_sender_tag() {
+        assert_eq!(command_text("✊FR44TRIG-c14 fixe: !ping"), Some("ping"));
+        assert_eq!(command_text("FR44TRIG-c14 fixe: !ping"), Some("ping"));
+    }
+
+    /// A sentence is not a tag: without the marker after `": "` there is no
+    /// command, so chat cannot earn a reply.
+    #[test]
+    fn command_text_requires_the_marker_after_the_tag() {
+        assert_eq!(command_text("see you: ping"), None);
+        assert_eq!(command_text("hello: world !ping"), None);
+    }
+
+    /// The nickname is quoted verbatim — symbol included, no reshaping — so a
+    /// reply names the sender exactly as the app wrote them.
+    #[test]
+    fn sender_nickname_is_the_tag_verbatim() {
+        assert_eq!(
+            sender_nickname("✊FR44TRIG-c14 fixe: !ping"),
+            Some("✊FR44TRIG-c14 fixe")
+        );
+        assert_eq!(
+            sender_nickname("✊44NTE-Tico-WTag: !komodo"),
+            Some("✊44NTE-Tico-WTag")
+        );
+        assert_eq!(sender_nickname("NICKNAME: !komodo"), Some("NICKNAME"));
+    }
+
+    #[test]
+    fn sender_nickname_is_none_without_a_tag() {
+        assert_eq!(sender_nickname("!ping"), None);
+        assert_eq!(sender_nickname("!hey: komodo"), None);
     }
 
     #[test]
