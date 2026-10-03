@@ -176,12 +176,15 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
                         });
                     }
                     EventPayload::ChannelMessage(msg) => {
+                        // `msg.path_len` is the packed wire byte, not a hop count.
+                        let hops = hop_count(msg.path_len);
+
                         // Consume the logged path for whatever message comes next,
                         // monitored or not, so a packet on a channel this bot ignores
                         // cannot leave its route to be attached to a later reply.
                         let correlated = pending_path
                             .take()
-                            .filter(|p| correlate(p, msg.path_len, Instant::now()));
+                            .filter(|p| correlate(p, hops, Instant::now()));
 
                         let Some((_, name)) = loaded
                             .channels
@@ -197,13 +200,13 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
                         tracing::info!(
                             channel_idx = msg.channel_idx,
                             message_id = msg.message_id(),
-                            path_len = msg.path_len,
+                            hops,
                             text = %msg.text,
                             "channel message"
                         );
 
-                        let repeaters = match correlated {
-                            Some(p) => {
+                        let resolved = match &correlated {
+                            Some(p) if !p.hashes.is_empty() => {
                                 let mut names = Vec::with_capacity(p.hashes.len());
                                 for hash in &p.hashes {
                                     names.push(
@@ -215,11 +218,12 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
                                 }
                                 render_repeaters(&p.hashes, &names)
                             }
-                            None => "?".to_string(),
+                            _ => String::new(),
                         };
+                        let repeaters = chain(correlated.as_ref(), &resolved);
 
                         let meta = parse::MessageMeta {
-                            path_len: msg.path_len,
+                            path_len: hops,
                             snr: msg.snr,
                             sender_timestamp: msg.sender_timestamp,
                             repeaters,
@@ -296,6 +300,19 @@ struct PendingPath {
 /// packet cannot be mistaken for the message's route.
 const PATH_MATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Hop count from the companion protocol's packed path byte.
+///
+/// `ChannelMessage::path_len` is the encoded wire byte — bits 0-5 are the hop
+/// count and bits 6-7 are the hash-size code (`hash_size - 1`), not a byte
+/// count; the MeshCore packet format packs them (`0x45` is 5 hops with 2-byte
+/// hashes, `0x40` is 0 hops with 2-byte hashes). `0xFF` means the packet arrived
+/// via a direct route and carries no hop count. meshcore-rs 0.2.0 decodes this
+/// correctly for the RF log but exposes the raw byte on `ChannelMessage`, so the
+/// mask lives here until the crate does it.
+fn hop_count(path_len: u8) -> u8 {
+    if path_len == 0xFF { 0 } else { path_len & 0x3F }
+}
+
 /// Whether a logged path belongs to the message being handled.
 ///
 /// Both the hop count and the age are checked: a path that does not match the
@@ -323,13 +340,10 @@ fn split_path(path: &[u8], path_len: u8, hash_size: u8) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Render a hop chain as `A > B > C`, using a name when one resolved and the
-/// hop's hex id otherwise. An empty chain (or one that was not correlated) is
-/// `?`: the caller decides which, and both read the same on the air.
+/// Render a non-empty hop chain as `A > B > C`, using a name when one resolved
+/// and the hop's hex id otherwise. The empty and uncorrelated cases are decided
+/// by [`chain`], which is the only caller.
 fn render_repeaters(hashes: &[Vec<u8>], names: &[Option<String>]) -> String {
-    if hashes.is_empty() {
-        return "?".to_string();
-    }
     hashes
         .iter()
         .enumerate()
@@ -339,6 +353,20 @@ fn render_repeaters(hashes: &[Vec<u8>], names: &[Option<String>]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" > ")
+}
+
+/// The chain to put on the air, from the correlated RF-log path.
+///
+/// `None` is "could not correlate" and reads `?`; a correlated path with no
+/// hops is a real message that no repeater forwarded, and reads `direct`; else
+/// it is the resolved chain. Split out so the three cases are testable with no
+/// radio and no contacts.
+fn chain(correlated: Option<&PendingPath>, resolved: &str) -> String {
+    match correlated {
+        None => "?".to_string(),
+        Some(p) if p.hashes.is_empty() => "direct".to_string(),
+        Some(_) => resolved.to_string(),
+    }
 }
 
 /// Lowercase-free hex, so a hop id reads as a stable two-digit-per-byte token.
@@ -1399,9 +1427,38 @@ mod tests {
         assert_eq!(render_repeaters(&hashes, &names), "NODE-A > CCDD > EEFF");
     }
 
+    /// `ChannelMessage::path_len` is the packed wire byte: bits 0-5 hop count,
+    /// bits 6-7 hash-size code. `0xFF` is a direct route with no hop count. This
+    /// is the bug that made a zero-hop message report `64 hops`.
     #[test]
-    fn render_repeaters_is_question_mark_for_an_empty_chain() {
-        assert_eq!(render_repeaters(&[], &[]), "?");
+    fn hop_count_decodes_the_packed_path_byte() {
+        assert_eq!(hop_count(0x00), 0); // 0 hops, 1-byte hashes
+        assert_eq!(hop_count(0x05), 5); // 5 hops, 1-byte hashes
+        assert_eq!(hop_count(0x40), 0); // 0 hops, 2-byte hashes
+        assert_eq!(hop_count(0x45), 5); // 5 hops, 2-byte hashes
+        assert_eq!(hop_count(0x8A), 10); // 10 hops, 3-byte hashes
+        assert_eq!(hop_count(0xFF), 0); // direct route
+    }
+
+    #[test]
+    fn chain_is_direct_for_a_zero_hop_message() {
+        let p = pending(0, std::time::Duration::from_millis(1));
+        assert_eq!(chain(Some(&p), ""), "direct");
+    }
+
+    #[test]
+    fn chain_is_question_mark_when_not_correlated() {
+        assert_eq!(chain(None, ""), "?");
+    }
+
+    #[test]
+    fn chain_is_the_resolved_chain_when_correlated() {
+        let p = PendingPath {
+            path_len: 2,
+            hashes: vec![vec![0xAA], vec![0xBB]],
+            at: Instant::now(),
+        };
+        assert_eq!(chain(Some(&p), "A > B"), "A > B");
     }
 
     fn pending(path_len: u8, age: std::time::Duration) -> PendingPath {
