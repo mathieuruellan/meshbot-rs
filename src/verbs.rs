@@ -538,7 +538,8 @@ fn edit_distance(a: &str, b: &str) -> usize {
 ///
 /// The message metadata is injected here rather than parsed, so a template can
 /// read `{{hops}}`, `{{delay}}`, `{{snr}}`, `{{sender_timestamp}}` and
-/// `{{repeaters}}` without any of them being message-supplied.
+/// `{{repeaters}}` without any of them being message-supplied. `{{sender}}` is
+/// injected by `decide` instead, because it comes from the raw text's tag.
 pub fn with_system(ctx: &mut Context, channel: &str, channel_idx: u8, meta: &MessageMeta) {
     ctx.set_system("channel", Value::Word(channel.to_string()));
     ctx.set_system("channel_idx", Value::Int(i64::from(channel_idx)));

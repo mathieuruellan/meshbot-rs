@@ -318,6 +318,7 @@ fn validate_action(
         &[
             "target",
             "stdout",
+            "sender",
             "hops",
             "delay",
             "snr",
