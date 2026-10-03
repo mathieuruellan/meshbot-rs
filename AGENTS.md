@@ -67,6 +67,31 @@ MESHBOT_SCRIPT_DIR=./scripts.example cargo run
   the vmid map in `scripts.example/pve-reboot.sh` is placeholders. URLs use
   `example.com`. This applies to test fixtures as much as to documentation.
 
+## Working on this repo (branch and workspace)
+Do every change on a **fresh branch off an up-to-date `origin/main`**, in this
+repository's own workspace/checkout — never on a long-lived branch, a branch
+whose PR has already merged, or a checkout that has not fetched.
+
+```bash
+git fetch origin
+git switch -c <type>/<short-topic> origin/main
+# ... work, commit ...
+git push -u origin <type>/<short-topic>    # open a PR into main
+```
+
+- **`origin/main` is the only base.** A local `main` (or any local branch) can be
+  arbitrarily stale, and a branch that has already been merged is a dead end:
+  committing on it builds on history that will never ship. Always
+  `git fetch origin` first and branch from `origin/main` by name, not from
+  whatever happens to be checked out.
+- **This repository is its own workspace.** Work in its own checkout and its own
+  session. Do not edit it from the `meshcore` deployment workspace, or vice
+  versa: the two repos have separate histories, remotes and deploy triggers.
+- **`main` is the default branch.** `feat:`/`fix:` commits reach it through a PR;
+  release-please opens the release PR and publishes the versioned image (see
+  [Deployment model](#deployment-model)). Do not commit straight to a branch
+  that is already the base of an open or merged PR.
+
 ## Deployment model
 Two repos, two triggers. This one publishes an image; it is never built by
 `meshcore`.
