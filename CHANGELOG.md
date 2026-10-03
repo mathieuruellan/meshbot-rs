@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.6.0...v0.6.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* decode the packed path byte so hops is a hop count ([deb60f5](https://github.com/mathieuruellan/meshbot-rs/commit/deb60f53e54e71c311cc9a60fd6c5b7193fead16))
+* decode the packed path byte so hops is a hop count ([7cd9e99](https://github.com/mathieuruellan/meshbot-rs/commit/7cd9e99afc1b10b55e3692d81c4522e42a947c84))
+
 ## [0.6.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.5.0...v0.6.0) (2026-10-03)
 
 
