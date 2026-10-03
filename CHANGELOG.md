@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.6.1...v0.7.0) (2026-10-03)
+
+
+### Features
+
+* accept multi-word sender tags and name the sender in replies ([62e9724](https://github.com/mathieuruellan/meshbot-rs/commit/62e972494fc2fd4b5cd1e7c2d60caabbed479753))
+* accept multi-word sender tags and name the sender in replies ([b9aea07](https://github.com/mathieuruellan/meshbot-rs/commit/b9aea073bc357b506724660961eac2e86c002b0c))
+
 ## [0.6.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.6.0...v0.6.1) (2026-10-03)
 
 
