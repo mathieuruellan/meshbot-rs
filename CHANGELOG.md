@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.5.0...v0.6.0) (2026-10-03)
+
+
+### Features
+
+* report channel message path, hops and delay ([0c3e65b](https://github.com/mathieuruellan/meshbot-rs/commit/0c3e65bd98a976f68407981bfa59a8c2305e2d52))
+* report channel message path, hops and delay ([efb021d](https://github.com/mathieuruellan/meshbot-rs/commit/efb021d390b0e6d1c2253d4b75caecbd93311295))
+
 ## [0.5.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.4.1...v0.5.0) (2026-10-02)
 
 
