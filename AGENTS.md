@@ -543,15 +543,22 @@ Recorded so implementation doesn't relitigate them.
   nothing and succeeds, rendering its `reply` from the context alone; the loader
   refuses `{{stdout}}` there, because no process could fill it. `ping` is the
   example.
-- **Message metadata**: after parsing, `with_system` injects `hops` (the
-  `path_len` the radio reported), `delay` (now minus the sender timestamp,
-  clamped at zero so a sender whose clock is ahead reads `0`, not negative),
-  `snr` when present, `sender_timestamp`, and `repeaters`. The repeater chain is
-  **not** in `ChannelMessage`; it is read from the `LOG_DATA` RF log the radio
-  pushes immediately before the fetched message, matched on hop count and a
-  short freshness window. A missed or mismatched log yields `?` rather than a
-  guess, and each hop resolves to a contact name when the radio has one and its
-  hex id otherwise.
+- **Message metadata**: after parsing, `with_system` injects `hops`, `delay` (now
+  minus the sender timestamp, clamped at zero so a sender whose clock is ahead
+  reads `0`, not negative), `snr` when present, `sender_timestamp`, and
+  `repeaters`. `hops` is **not** `ChannelMessage::path_len` directly: that field
+  is the companion protocol's packed wire byte (bits 0-5 = hop count, bits 6-7 =
+  hash-size code, `0xFF` = direct), so it goes through `hop_count()`. The
+  repeater chain is **not** in `ChannelMessage`; it is read from the `LOG_DATA`
+  RF log the radio pushes immediately before the fetched message, matched on hop
+  count and a short freshness window. Each hop resolves to a contact name when
+  the radio has one and its hex id otherwise. An uncorrelated path renders `?`,
+  a correlated zero-hop message renders `direct`, and a real chain renders
+  `A > B > C`.
+- **`hop_count()` masks a meshcore-rs 0.2.0 gap.** The crate decodes the packed
+  path byte correctly in `parse_mesh_packet_header` (the RF log) but exposes the
+  raw byte on `ChannelMessage`, so a zero-hop message arrives as `0x40` (64). If
+  a future crate release decodes it, remove the mask here and the upstream issue.
 - **Replies**: a successful action produces **one message per line** of its
   rendered reply, capped at `MAX_REPLIES` (4) plus a `+N more` line — so a script
   listing eleven things never becomes eleven transmissions. A single line that
