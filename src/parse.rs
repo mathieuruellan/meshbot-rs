@@ -39,6 +39,10 @@ pub const RESERVED_KEYS: &[&str] = &[
     "channel_idx",
     "snr",
     "sender_timestamp",
+    "path_len",
+    "hops",
+    "delay",
+    "repeaters",
     "status",
     "stdout",
     "target",
@@ -114,6 +118,28 @@ impl Reserved {
                 .collect(),
         )
     }
+}
+
+/// What the radio reported about the packet a channel message arrived in.
+///
+/// These are engine values, not message-body values: `set_message` refuses them
+/// (they are reserved), and [`crate::verbs::with_system`] injects them after
+/// parsing so a template can render them. `repeaters` is pre-rendered by the
+/// caller because resolving hop hashes to names needs the contact list, which
+/// lives behind the `MeshCore` handle and not in this pure module.
+#[derive(Debug, Clone, Default)]
+pub struct MessageMeta {
+    /// Number of repeaters the packet traversed, from the channel message.
+    pub path_len: u8,
+    /// Signal-to-noise ratio, when the firmware reports it (v3 messages).
+    pub snr: Option<f32>,
+    /// The sender's own timestamp, in Unix seconds.
+    pub sender_timestamp: u32,
+    /// Repeater chain rendered for the air, or `?` when it could not be
+    /// correlated with the RF log.
+    pub repeaters: String,
+    /// Wall clock at handling time, for the delay.
+    pub now: u32,
 }
 
 /// The parsed form of one message.
@@ -632,9 +658,11 @@ mod tests {
 
     #[test]
     fn canonical_sorts_args_so_equivalent_commands_share_a_latch() {
-        let a = parse("reboot alpha delay=5").unwrap();
-        let b = parse("reboot delay=5 alpha").unwrap();
-        assert_eq!(a.canonical(), "reboot alpha delay=5");
+        // `note`, not `delay`: `delay` is an engine-injected reserved key, so it
+        // is deliberately excluded from the latch key.
+        let a = parse("reboot alpha note=5").unwrap();
+        let b = parse("reboot note=5 alpha").unwrap();
+        assert_eq!(a.canonical(), "reboot alpha note=5");
         assert_eq!(a.canonical(), b.canonical());
     }
 }

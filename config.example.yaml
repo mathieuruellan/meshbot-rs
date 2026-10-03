@@ -165,6 +165,17 @@ verbs:
       args: ["8.8.8.8", "1.1.1.1"]
       reply: "{{stdout}}"
 
+  - name: ping
+    desc: "hops, delay and repeaters of your message"
+    channel: "#admin"
+    # A reply-only action: no script, because everything it reports comes from
+    # the message metadata the engine injects. `{{hops}}` is the hop count,
+    # `{{delay}}` the seconds between the sender's timestamp and now, and
+    # `{{repeaters}}` the chain of repeater names (or hop ids) the packet
+    # traversed, or `?` when it could not be correlated with the RF log.
+    get:
+      reply: "ping: {{delay}}s, {{hops}} hops | {{repeaters}}"
+
   - name: komodo
     desc: "unhealthy stacks and servers"
     channel: "#admin"

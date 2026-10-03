@@ -204,7 +204,10 @@ pub fn command_for(
     ctx: &Message,
     dir: &Path,
 ) -> Result<(PathBuf, Vec<String>, HashMap<String, String>)> {
-    let script = resolve_script(&action.script, dir)?;
+    let Some(name) = action.script.as_deref() else {
+        bail!("reply-only action has no script to run");
+    };
+    let script = resolve_script(name, dir)?;
     let mut args = Vec::with_capacity(action.args.len());
     for template in &action.args {
         args.push(expand(template, ctx, None)?);
@@ -245,12 +248,23 @@ fn spawn_child(command: &mut Command) -> std::io::Result<tokio::process::Child> 
 /// Never propagates an error to the caller: a failed action is a reply, not a
 /// crash, and the bot has to keep listening either way.
 pub async fn run(action: &ActionSpec, ctx: &Message, dir: &Path) -> Outcome {
+    // A reply-only action runs nothing and succeeds: the caller renders its
+    // template from the message context, and `{{stdout}}` is empty.
+    if action.script.is_none() {
+        return Outcome {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+            error: None,
+        };
+    }
+
     let timeout = Duration::from_secs(action.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
     let (script, args, env) = match command_for(action, ctx, dir) {
         Ok(parts) => parts,
         Err(err) => {
-            tracing::warn!(script = %action.script, %err, "action not runnable");
+            tracing::warn!(script = ?action.script, %err, "action not runnable");
             return Outcome {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -537,7 +551,7 @@ mod tests {
         let dir = sandbox_with_ok();
         let ctx = parse::parse(r#"reboot alpha note="a; rm -rf / b""#).unwrap();
         let action = ActionSpec {
-            script: "ok.sh".into(),
+            script: Some("ok.sh".into()),
             args: vec!["{{note}}".into()],
             env: vec![],
             ..ActionSpec::default()
@@ -634,7 +648,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "say.sh".into(),
+            script: Some("say.sh".into()),
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
@@ -658,7 +672,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "say.sh".into(),
+            script: Some("say.sh".into()),
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
@@ -692,7 +706,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "boom.sh".into(),
+            script: Some("boom.sh".into()),
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
@@ -716,7 +730,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "quiet-fail.sh".into(),
+            script: Some("quiet-fail.sh".into()),
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
@@ -750,7 +764,7 @@ mod tests {
         SPAWN_FAILURES.store(1, Ordering::Relaxed);
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "never.sh".into(),
+            script: Some("never.sh".into()),
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;
@@ -779,7 +793,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "ok.sh".into(),
+            script: Some("ok.sh".into()),
             env: vec!["MESHBOT_TEST_ABSENT".into()],
             ..ActionSpec::default()
         };
@@ -811,7 +825,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "slow-fail.sh".into(),
+            script: Some("slow-fail.sh".into()),
             timeout_secs: Some(1),
             ..ActionSpec::default()
         };
@@ -837,7 +851,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "chatty-ok.sh".into(),
+            script: Some("chatty-ok.sh".into()),
             reply: "{{stdout}}".into(),
             ..ActionSpec::default()
         };
@@ -862,7 +876,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "loud-fail.sh".into(),
+            script: Some("loud-fail.sh".into()),
             ..ActionSpec::default()
         };
         let reply = {
@@ -895,7 +909,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "flood.sh".into(),
+            script: Some("flood.sh".into()),
             timeout_secs: Some(5),
             ..ActionSpec::default()
         };
@@ -920,7 +934,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "slow.sh".into(),
+            script: Some("slow.sh".into()),
             timeout_secs: Some(1),
             ..ActionSpec::default()
         };
@@ -947,7 +961,7 @@ mod tests {
 
         let ctx = parse::parse("alarm arm").unwrap();
         let action = ActionSpec {
-            script: "loud.sh".into(),
+            script: Some("loud.sh".into()),
             ..ActionSpec::default()
         };
         let outcome = run(&action, &ctx, &dir).await;

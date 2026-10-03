@@ -288,8 +288,21 @@ fn validate_action(
 ) -> Result<()> {
     let at = format!("verb {verb:?} {which}");
 
-    script::resolve_script(&action.script, dir)
-        .with_context(|| format!("{at}: script {:?}", action.script))?;
+    // A reply-only action names no script. It must then build its reply from
+    // the context alone, so `{{stdout}}` — which only a script can fill — is
+    // refused rather than rendered empty.
+    match &action.script {
+        Some(script) => {
+            script::resolve_script(script, dir)
+                .with_context(|| format!("{at}: script {script:?}"))?;
+        }
+        None => {
+            ensure!(
+                !action.reply.contains("{{stdout}}"),
+                "{at}: has no script, so {{{{stdout}}}} can never be filled"
+            );
+        }
+    }
 
     ensure!(
         !action.confirm || action.mutating,
@@ -299,7 +312,19 @@ fn validate_action(
     for arg in &action.args {
         check_template(&at, arg, &["target"])?;
     }
-    check_template(&at, &action.reply, &["target", "stdout"])?;
+    check_template(
+        &at,
+        &action.reply,
+        &[
+            "target",
+            "stdout",
+            "hops",
+            "delay",
+            "snr",
+            "sender_timestamp",
+            "repeaters",
+        ],
+    )?;
 
     for name in &action.env {
         let name = name.trim();
@@ -438,6 +463,39 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("only {{target}}"), "{err}");
+    }
+
+    /// A reply-only action needs no script; it builds its answer from the
+    /// message context alone. This is what `ping` uses.
+    #[test]
+    fn a_reply_only_action_needs_no_script() {
+        let loaded = config(
+            "  - name: ping\n    channel: admin\n    get:\n      reply: \"ping: {{delay}}s, {{hops}} hops | {{repeaters}}\"\n",
+        )
+        .unwrap();
+        assert!(loaded.table.get("ping").is_some());
+    }
+
+    /// Without a script there is nothing to fill `{{stdout}}`, so it is a config
+    /// error rather than a reply that silently renders empty.
+    #[test]
+    fn stdout_in_a_reply_only_action_is_fatal() {
+        let err =
+            config("  - name: ping\n    channel: admin\n    get:\n      reply: \"{{stdout}}\"\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("stdout"), "{err}");
+    }
+
+    /// The message-metadata placeholders are accepted alongside `{{target}}`.
+    #[test]
+    fn metadata_placeholders_are_accepted() {
+        for placeholder in ["hops", "delay", "snr", "sender_timestamp", "repeaters"] {
+            let raw = format!(
+                "  - name: ping\n    channel: admin\n    get:\n      script: ok.sh\n      reply: \"{{{{{placeholder}}}}}\"\n"
+            );
+            assert!(config(&raw).is_ok(), "{{{{{placeholder}}}}} was refused");
+        }
     }
 
     #[test]

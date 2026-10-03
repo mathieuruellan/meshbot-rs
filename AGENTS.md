@@ -67,6 +67,31 @@ MESHBOT_SCRIPT_DIR=./scripts.example cargo run
   the vmid map in `scripts.example/pve-reboot.sh` is placeholders. URLs use
   `example.com`. This applies to test fixtures as much as to documentation.
 
+## Working on this repo (branch and workspace)
+Do every change on a **fresh branch off an up-to-date `origin/main`**, in this
+repository's own workspace/checkout — never on a long-lived branch, a branch
+whose PR has already merged, or a checkout that has not fetched.
+
+```bash
+git fetch origin
+git switch -c <type>/<short-topic> origin/main
+# ... work, commit ...
+git push -u origin <type>/<short-topic>    # open a PR into main
+```
+
+- **`origin/main` is the only base.** A local `main` (or any local branch) can be
+  arbitrarily stale, and a branch that has already been merged is a dead end:
+  committing on it builds on history that will never ship. Always
+  `git fetch origin` first and branch from `origin/main` by name, not from
+  whatever happens to be checked out.
+- **This repository is its own workspace.** Work in its own checkout and its own
+  session. Do not edit it from the `meshcore` deployment workspace, or vice
+  versa: the two repos have separate histories, remotes and deploy triggers.
+- **`main` is the default branch.** `feat:`/`fix:` commits reach it through a PR;
+  release-please opens the release PR and publishes the versioned image (see
+  [Deployment model](#deployment-model)). Do not commit straight to a branch
+  that is already the base of an open or merged PR.
+
 ## Deployment model
 Two repos, two triggers. This one publishes an image; it is never built by
 `meshcore`.
@@ -508,17 +533,36 @@ Recorded so implementation doesn't relitigate them.
   character boundary. The old `max_reply_chars: 200` was wrong in kind and in
   number.
 - **Templates**: `{{slot}}` for a declared value, `{{stdout}}` for the clamped
-  action result, `${ENV}` for environment. Unresolved placeholder ⇒ fail at
-  config load, not at message time. There is deliberately no `{{text}}`: action
-  arguments may only expand to values the verb table declares.
+  action result. Unresolved placeholder ⇒ fail at config load, not at message
+  time. There is deliberately no `{{text}}`: action arguments may only expand to
+  values the verb table declares. `${ENV}` is not expanded either — `.env` is
+  read verbatim, so a script reads a value from the environment via `env:`
+  instead. A reply may also read the message metadata the engine injects:
+  `{{hops}}`, `{{delay}}`, `{{snr}}`, `{{sender_timestamp}}` and `{{repeaters}}`.
+- **Reply-only actions**: `script` is optional. With no script the action runs
+  nothing and succeeds, rendering its `reply` from the context alone; the loader
+  refuses `{{stdout}}` there, because no process could fill it. `ping` is the
+  example.
+- **Message metadata**: after parsing, `with_system` injects `hops` (the
+  `path_len` the radio reported), `delay` (now minus the sender timestamp,
+  clamped at zero so a sender whose clock is ahead reads `0`, not negative),
+  `snr` when present, `sender_timestamp`, and `repeaters`. The repeater chain is
+  **not** in `ChannelMessage`; it is read from the `LOG_DATA` RF log the radio
+  pushes immediately before the fetched message, matched on hop count and a
+  short freshness window. A missed or mismatched log yields `?` rather than a
+  guess, and each hop resolves to a contact name when the radio has one and its
+  hex id otherwise.
 - **Replies**: a successful action produces **one message per line** of its
-  rendered reply, each truncated to one frame, capped at `MAX_REPLIES` (4) plus a
-  `+N more` line — so a script listing eleven things never becomes eleven
-  transmissions. Blank lines are dropped, so an action that renders to nothing
-  sends nothing rather than a blank frame. A **failed** action is always exactly
-  one message: it never renders its template, so a half-finished reboot is never
-  reported as done. `help` and `help <verb>` are built in and rendered from the
-  verb table, so a verb cannot be added without documenting it.
+  rendered reply, capped at `MAX_REPLIES` (4) plus a `+N more` line — so a script
+  listing eleven things never becomes eleven transmissions. A single line that
+  does not fit one frame is **not** truncated: it is split on word boundaries
+  into `i/n` fragments (`1/2 ...`, `2/2 ...`), and if it needs more than
+  `MAX_REPLIES` fragments the last carries a `…+N more` marker. Blank lines are
+  dropped, so an action that renders to nothing sends nothing rather than a blank
+  frame. A **failed** action is always exactly one message: it never renders its
+  template, so a half-finished reboot is never reported as done. `help` and
+  `help <verb>` are built in and rendered from the verb table, so a verb cannot
+  be added without documenting it.
 - **The stdout clamp is per line, not per blob.** It used to be applied to the
   whole of stdout in `script::run`, which silently truncated a multi-line report
   mid-list. `verbs::split_reply` applies it per line at the point of becoming
