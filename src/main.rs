@@ -16,10 +16,11 @@ mod script;
 mod verbs;
 
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
-use meshcore_rs::{EventPayload, EventType, MeshCore};
+use meshcore_rs::{EventPayload, MeshCore, PayloadType};
 use parse::ParseError;
 
 /// How long to wait between read-only liveness probes of the radio.
@@ -120,13 +121,29 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
         return Ended::Fatal(err);
     }
 
+    // Best effort: the hop hashes in the RF log resolve to names only when the
+    // repeater is a contact. A radio that will not hand over its contact list
+    // must not stop the bot; unresolved hops fall back to their hex id.
+    match meshcore.ensure_contacts().await {
+        Ok(()) => tracing::debug!("contact cache loaded for path name resolution"),
+        Err(err) => tracing::warn!(%err, "could not load contacts; hop ids stay hex"),
+    }
+
     // Returns unit, not a Result — there is nothing to await that can fail.
     meshcore.start_auto_message_fetching().await;
     tracing::info!("listening for channel messages");
 
     let script_dir = &loaded.script_dir;
     let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-    let mut stream = meshcore.event_stream_filtered(EventType::ChannelMsgRecv);
+    // The radio pushes the RF log (`LOG_DATA`) for every packet it receives,
+    // immediately before the fetched message that carries the text. The header
+    // of that log is the only place the hop path appears: `ChannelMessage`
+    // itself carries `path_len` but not the hashes. So the most recent channel
+    // packet's path is held here and attached to the next message that matches
+    // it, and dropped otherwise rather than guessed at.
+    let mut pending_path: Option<PendingPath> = None;
+
+    let mut stream = meshcore.event_stream();
 
     // `interval` fires immediately on its first tick; consume it so the first
     // probe is one interval out rather than at connect time. `Delay` keeps a
@@ -144,37 +161,87 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
                     disconnect(&meshcore).await;
                     return Ended::Reconnect(anyhow::anyhow!("channel event stream ended"));
                 };
-                if let EventPayload::ChannelMessage(msg) = event.payload {
-                    let Some((_, name)) = loaded
-                        .channels
-                        .iter()
-                        .find(|(idx, _)| *idx == msg.channel_idx)
-                    else {
-                        // Not in the listen set. The channel map is both the filter and
-                        // the startup assertion, so a message from anywhere else is
-                        // dropped before it is even parsed.
-                        tracing::debug!(channel_idx = msg.channel_idx, "channel not monitored");
-                        continue;
-                    };
-                    tracing::info!(
-                        channel_idx = msg.channel_idx,
-                        message_id = msg.message_id(),
-                        text = %msg.text,
-                        "channel message"
-                    );
-                    // Sequential, deliberately. One message is resolved, executed and
-                    // answered before the next is read, so two actions cannot interleave
-                    // their scripts or their replies.
-                    handle_message(
-                        &meshcore,
-                        loaded,
-                        &mut latch,
-                        script_dir,
-                        &msg.text,
-                        name,
-                        msg.channel_idx,
-                    )
-                    .await;
+                match event.payload {
+                    EventPayload::LogData(log) => {
+                        let Some(header) = log.header else {
+                            continue;
+                        };
+                        if header.payload_type != PayloadType::GroupText {
+                            continue;
+                        }
+                        pending_path = Some(PendingPath {
+                            path_len: header.path_len,
+                            hashes: split_path(&header.path, header.path_len, header.path_hash_size),
+                            at: Instant::now(),
+                        });
+                    }
+                    EventPayload::ChannelMessage(msg) => {
+                        // Consume the logged path for whatever message comes next,
+                        // monitored or not, so a packet on a channel this bot ignores
+                        // cannot leave its route to be attached to a later reply.
+                        let correlated = pending_path
+                            .take()
+                            .filter(|p| correlate(p, msg.path_len, Instant::now()));
+
+                        let Some((_, name)) = loaded
+                            .channels
+                            .iter()
+                            .find(|(idx, _)| *idx == msg.channel_idx)
+                        else {
+                            // Not in the listen set. The channel map is both the filter and
+                            // the startup assertion, so a message from anywhere else is
+                            // dropped before it is even parsed.
+                            tracing::debug!(channel_idx = msg.channel_idx, "channel not monitored");
+                            continue;
+                        };
+                        tracing::info!(
+                            channel_idx = msg.channel_idx,
+                            message_id = msg.message_id(),
+                            path_len = msg.path_len,
+                            text = %msg.text,
+                            "channel message"
+                        );
+
+                        let repeaters = match correlated {
+                            Some(p) => {
+                                let mut names = Vec::with_capacity(p.hashes.len());
+                                for hash in &p.hashes {
+                                    names.push(
+                                        meshcore
+                                            .get_contact_by_prefix(hash)
+                                            .await
+                                            .map(|c| c.adv_name),
+                                    );
+                                }
+                                render_repeaters(&p.hashes, &names)
+                            }
+                            None => "?".to_string(),
+                        };
+
+                        let meta = parse::MessageMeta {
+                            path_len: msg.path_len,
+                            snr: msg.snr,
+                            sender_timestamp: msg.sender_timestamp,
+                            repeaters,
+                            now: now_secs(),
+                        };
+
+                        // Sequential, deliberately. One message is resolved, executed and
+                        // answered before the next is read, so two actions cannot interleave
+                        // their scripts or their replies.
+                        handle_message(
+                            &meshcore,
+                            loaded,
+                            &mut latch,
+                            script_dir,
+                            &msg.text,
+                            name,
+                            msg.channel_idx,
+                            &meta,
+                        )
+                        .await;
+                    }
+                    _ => {}
                 }
             }
             _ = probe.tick() => {
@@ -213,6 +280,75 @@ async fn disconnect(meshcore: &MeshCore) {
     if let Err(err) = meshcore.disconnect().await {
         tracing::warn!(%err, "disconnect failed");
     }
+}
+
+/// The hop chain of the most recent channel packet the RF log reported.
+struct PendingPath {
+    path_len: u8,
+    hashes: Vec<Vec<u8>>,
+    at: Instant,
+}
+
+/// How long a logged path stays a candidate for the next channel message.
+///
+/// The radio pushes the RF log a few milliseconds before the fetched message,
+/// so this only absorbs scheduling jitter; it is short enough that an unrelated
+/// packet cannot be mistaken for the message's route.
+const PATH_MATCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a logged path belongs to the message being handled.
+///
+/// Both the hop count and the age are checked: a path that does not match the
+/// message's hop count is a different packet, and a stale one was not followed
+/// by a message at all.
+fn correlate(pending: &PendingPath, msg_path_len: u8, now: Instant) -> bool {
+    pending.path_len == msg_path_len && now.duration_since(pending.at) < PATH_MATCH_WINDOW
+}
+
+/// Split a raw hop path into one hash per repeater.
+///
+/// `path` is `path_len * hash_size` bytes, one hash of `hash_size` bytes per
+/// repeater. A `hash_size` of zero is refused rather than dividing the path into
+/// infinite empty hops, and a truncated path yields only the hops it holds.
+fn split_path(path: &[u8], path_len: u8, hash_size: u8) -> Vec<Vec<u8>> {
+    if hash_size == 0 {
+        return Vec::new();
+    }
+    let size = usize::from(hash_size);
+    (0..usize::from(path_len))
+        .filter_map(|i| {
+            let start = i * size;
+            path.get(start..start + size).map(<[u8]>::to_vec)
+        })
+        .collect()
+}
+
+/// Render a hop chain as `A > B > C`, using a name when one resolved and the
+/// hop's hex id otherwise. An empty chain (or one that was not correlated) is
+/// `?`: the caller decides which, and both read the same on the air.
+fn render_repeaters(hashes: &[Vec<u8>], names: &[Option<String>]) -> String {
+    if hashes.is_empty() {
+        return "?".to_string();
+    }
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(i, hash)| match names.get(i).and_then(|n| n.as_deref()) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => hex(hash),
+        })
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+/// Lowercase-free hex, so a hop id reads as a stable two-digit-per-byte token.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02X}");
+    }
+    out
 }
 
 /// What a message should cause.
@@ -259,6 +395,7 @@ fn decide<'a>(
     raw: &str,
     channel: &str,
     channel_idx: u8,
+    meta: &parse::MessageMeta,
 ) -> Decision<'a> {
     // The marker decides whether this is a command at all. Everything below
     // works on the text *after* it, never on the raw message, so the sender tag
@@ -293,7 +430,7 @@ fn decide<'a>(
             return Decision::Ignore;
         }
     };
-    verbs::with_system(&mut ctx, channel, channel_idx);
+    verbs::with_system(&mut ctx, channel, channel_idx, meta);
 
     if ctx.is_poisoned("channel") || ctx.is_poisoned("channel_idx") {
         // A relayed message tried to claim a different channel than the one it
@@ -366,7 +503,7 @@ fn decide<'a>(
                 channel_idx,
                 verb = %verb.name,
                 target = ?word,
-                script = %action.script,
+                script = ?action.script,
                 "running action"
             );
             Decision::Execute { action, ctx }
@@ -448,6 +585,9 @@ async fn set_radio_clock(meshcore: &MeshCore) {
 }
 
 /// One inbound message, end to end. I/O only: [`decide`] has already decided.
+// The parameters are the pieces of the decision plus the I/O handle; grouping
+// them into a struct would only move the same fields behind one more name.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     meshcore: &MeshCore,
     config: &config::Loaded,
@@ -456,6 +596,7 @@ async fn handle_message(
     text: &str,
     channel: &str,
     channel_idx: u8,
+    meta: &parse::MessageMeta,
 ) {
     match decide(
         &config.table,
@@ -464,6 +605,7 @@ async fn handle_message(
         text,
         channel,
         channel_idx,
+        meta,
     ) {
         Decision::Ignore => {}
         Decision::Reply(reply) => send(meshcore, channel_idx, &[reply]).await,
@@ -495,7 +637,7 @@ fn render(
     match script::expand(&action.reply, ctx, Some(&outcome.stdout)) {
         Ok(reply) => verbs::split_reply(&reply),
         Err(err) => {
-            tracing::warn!(script = %action.script, %err, "reply template did not expand");
+            tracing::warn!(script = ?action.script, %err, "reply template did not expand");
             vec!["action failed".to_string()]
         }
     }
@@ -681,7 +823,15 @@ mod tests {
             .find(|(_, n)| n == channel)
             .map(|(i, _)| *i)
             .expect("channel is in the listen set");
-        decide(table, &loaded.reserved, latch, raw, channel, idx)
+        decide(
+            table,
+            &loaded.reserved,
+            latch,
+            raw,
+            channel,
+            idx,
+            &parse::MessageMeta::default(),
+        )
     }
 
     // ---- the latch, which is the only thing standing between a message and a
@@ -1061,7 +1211,7 @@ mod tests {
     #[test]
     fn a_failed_action_never_renders_its_template() {
         let action = verbs::ActionSpec {
-            script: "boom.sh".into(),
+            script: Some("boom.sh".into()),
             reply: "{{stdout}}".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1084,7 +1234,7 @@ mod tests {
     #[test]
     fn a_missing_script_reports_a_generic_failure() {
         let action = verbs::ActionSpec {
-            script: "missing.sh".into(),
+            script: Some("missing.sh".into()),
             reply: "{{stdout}}".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1104,7 +1254,7 @@ mod tests {
     #[test]
     fn a_successful_literal_reply_is_its_own_text() {
         let action = verbs::ActionSpec {
-            script: "ha-service.sh".into(),
+            script: Some("ha-service.sh".into()),
             reply: "opening".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1125,7 +1275,7 @@ mod tests {
     #[test]
     fn an_unexpandable_template_degrades() {
         let action = verbs::ActionSpec {
-            script: "ha-entity.sh".into(),
+            script: Some("ha-entity.sh".into()),
             reply: "{{nope}}".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1147,7 +1297,7 @@ mod tests {
     #[test]
     fn silence_renders_as_no_reply() {
         let action = verbs::ActionSpec {
-            script: "quiet.sh".into(),
+            script: Some("quiet.sh".into()),
             reply: "{{stdout}}".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1166,7 +1316,7 @@ mod tests {
     #[test]
     fn every_reply_fits_in_one_frame() {
         let action = verbs::ActionSpec {
-            script: "loud.sh".into(),
+            script: Some("loud.sh".into()),
             reply: "{{stdout}}".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1196,7 +1346,7 @@ mod tests {
     #[test]
     fn each_line_of_stdout_becomes_its_own_message() {
         let action = verbs::ActionSpec {
-            script: "komodo-status.sh".into(),
+            script: Some("komodo-status.sh".into()),
             reply: "{{stdout}}".into(),
             ..verbs::ActionSpec::default()
         };
@@ -1214,6 +1364,107 @@ mod tests {
                 "2/3 stack meshcore unhealthy",
                 "3/3 stack ha down"
             ]
+        );
+    }
+
+    // ---- the RF-log hop path
+
+    #[test]
+    fn split_path_cuts_the_path_into_one_hash_per_hop() {
+        // Three hops of two-byte hashes.
+        let path = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(
+            split_path(&path, 3, 2),
+            vec![vec![0xAA, 0xBB], vec![0xCC, 0xDD], vec![0xEE, 0xFF]]
+        );
+    }
+
+    /// A zero hash size would divide the path into infinite empty hops.
+    #[test]
+    fn split_path_refuses_a_zero_hash_size() {
+        assert!(split_path(&[1, 2, 3, 4], 2, 0).is_empty());
+    }
+
+    /// A truncated log yields only the hops it actually holds.
+    #[test]
+    fn split_path_yields_only_the_hops_it_holds() {
+        assert_eq!(split_path(&[0xAA], 3, 1), vec![vec![0xAA]]);
+    }
+
+    #[test]
+    fn render_repeaters_prefers_names_and_falls_back_to_hex() {
+        let hashes = vec![vec![0xAA, 0xBB], vec![0xCC, 0xDD], vec![0xEE, 0xFF]];
+        // Resolved, unresolved, and an empty name all in one chain.
+        let names = vec![Some("NODE-A".to_string()), None, Some(String::new())];
+        assert_eq!(render_repeaters(&hashes, &names), "NODE-A > CCDD > EEFF");
+    }
+
+    #[test]
+    fn render_repeaters_is_question_mark_for_an_empty_chain() {
+        assert_eq!(render_repeaters(&[], &[]), "?");
+    }
+
+    fn pending(path_len: u8, age: std::time::Duration) -> PendingPath {
+        PendingPath {
+            path_len,
+            hashes: Vec::new(),
+            at: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn correlate_requires_the_same_hop_count_and_a_fresh_log() {
+        let now = Instant::now();
+        assert!(correlate(
+            &pending(3, std::time::Duration::from_millis(10)),
+            3,
+            now
+        ));
+        // A different hop count is a different packet.
+        assert!(!correlate(
+            &pending(3, std::time::Duration::from_millis(10)),
+            4,
+            now
+        ));
+        // Too old: no message followed it.
+        assert!(!correlate(
+            &pending(3, PATH_MATCH_WINDOW + std::time::Duration::from_secs(1)),
+            3,
+            now
+        ));
+    }
+
+    /// End to end through `render`: a reply-only action (no script) builds its
+    /// answer entirely from the injected metadata.
+    #[test]
+    fn a_reply_only_action_renders_from_the_message_metadata() {
+        let action = verbs::ActionSpec {
+            script: None,
+            reply: "ping: {{delay}}s, {{hops}} hops | {{repeaters}}".into(),
+            ..verbs::ActionSpec::default()
+        };
+        let mut ctx = ctx_for("ping");
+        verbs::with_system(
+            &mut ctx,
+            ADMIN,
+            2,
+            &parse::MessageMeta {
+                path_len: 3,
+                sender_timestamp: 1000,
+                repeaters: "A > B > C".into(),
+                now: 1012,
+                ..parse::MessageMeta::default()
+            },
+        );
+        let outcome = script::Outcome {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+            error: None,
+        };
+        assert_eq!(
+            only(render(&action, &ctx, &outcome)),
+            "ping: 12s, 3 hops | A > B > C"
         );
     }
 }

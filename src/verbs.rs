@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::parse::{CONFIRM_SUFFIX, Context, Value};
+use crate::parse::{CONFIRM_SUFFIX, Context, MessageMeta, Value};
 
 /// Longest reply we will put on the air, in bytes.
 ///
@@ -34,7 +34,12 @@ pub const MAX_REPLIES: usize = 4;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionSpec {
-    pub script: String,
+    /// The script to run, or `None` for a **reply-only** action: one whose reply
+    /// is built entirely from the message context (for example `ping`, which
+    /// reports hops and delay) and needs no external process. A reply-only
+    /// action must not use `{{stdout}}`, which the loader enforces.
+    #[serde(default)]
+    pub script: Option<String>,
     /// Argument templates, e.g. `{{target}}`. They expand only to values the
     /// verb table declares, never to free message text.
     ///
@@ -361,15 +366,28 @@ pub fn clamp(s: &str, max: usize) -> String {
 /// exactly as before: the templates in `scripts.example/` all end in one line and
 /// this function returns one message for them.
 ///
+/// A **single** line that is too long is not truncated: it is split into
+/// numbered fragments by [`split_numbered`], so a long repeater chain arrives
+/// whole as `1/2 ...`, `2/2 ...`. Multi-line output is already one message per
+/// line, so those keep the per-line clamp and the overall cap.
+///
 /// Empty lines are dropped rather than sent, which preserves the rule that an
 /// action rendering to nothing says nothing instead of putting a blank frame on
 /// the air. Each line is clamped on its own, so a long first line cannot eat the
 /// budget of the ones after it.
 pub fn split_reply(rendered: &str) -> Vec<String> {
-    let lines: Vec<String> = rendered
+    let lines: Vec<&str> = rendered
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .collect();
+
+    if lines.len() == 1 {
+        return split_numbered(lines[0], MAX_REPLY_BYTES);
+    }
+
+    let lines: Vec<String> = lines
+        .into_iter()
         .map(|line| clamp(line, MAX_REPLY_BYTES))
         .collect();
 
@@ -381,6 +399,97 @@ pub fn split_reply(rendered: &str) -> Vec<String> {
     let mut out = lines[..MAX_REPLIES].to_vec();
     out.push(format!("+{omitted} more"));
     out
+}
+
+/// Split one over-long message into `i/n` fragments that each fit `max` bytes.
+///
+/// Word boundaries are preferred so a repeater name is never cut in half; a
+/// single token longer than a whole fragment is the one case that is cut
+/// mid-token, on a character boundary. The `i/n ` prefix counts against the
+/// budget, and a little more is reserved for the truncation suffix, so every
+/// fragment that comes back is sendable as-is.
+///
+/// At most [`MAX_REPLIES`] fragments are sent. If the text needs more, the last
+/// fragment is trimmed to make room for a `…+N more` marker rather than dropping
+/// the rest silently.
+pub fn split_numbered(text: &str, max: usize) -> Vec<String> {
+    if text.len() <= max {
+        return vec![text.to_string()];
+    }
+
+    // Room for the widest `i/n ` prefix we could need, plus a truncation suffix.
+    // Reserving both up front means the packing pass never has to be redone and
+    // no fragment is ever handed to `send` already over budget.
+    const PREFIX_RESERVE: usize = 8;
+    const SUFFIX_RESERVE: usize = 16;
+    let budget = max.saturating_sub(PREFIX_RESERVE + SUFFIX_RESERVE).max(1);
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let mut word = word;
+        loop {
+            let sep = usize::from(!current.is_empty());
+            if current.len() + sep + word.len() <= budget {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.push_str(word);
+                break;
+            }
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                continue;
+            }
+            // The word alone is wider than a fragment: cut a head off it.
+            let head = clamp(word, budget);
+            if head.is_empty() {
+                // Budget smaller than one character. Take the rest so the loop
+                // cannot spin.
+                current.push_str(word);
+                break;
+            }
+            let head_len = head.len();
+            chunks.push(head);
+            word = &word[head_len..];
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    let total = chunks.len();
+    let sent = total.min(MAX_REPLIES);
+    chunks.truncate(sent);
+    let mut out: Vec<String> = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| format!("{}/{sent} {chunk}", i + 1))
+        .collect();
+    if total > sent
+        && let Some(last) = out.last_mut()
+    {
+        push_within(last, &format!(" …+{} more", total - sent), max);
+    }
+    out
+}
+
+/// Append `suffix` to `s` without letting the result exceed `max` bytes.
+///
+/// Used for the truncation marker on the last fragment of a split: the fragment
+/// was packed to leave room, but a defensive trim here means the invariant holds
+/// even if the reserve above ever changes.
+fn push_within(s: &mut String, suffix: &str, max: usize) {
+    if s.len() + suffix.len() <= max {
+        s.push_str(suffix);
+        return;
+    }
+    let budget = max.saturating_sub(suffix.len());
+    let cut = clamp(s, budget);
+    let cut_len = cut.len();
+    s.truncate(cut_len);
+    s.push_str(suffix);
 }
 
 /// Typo tolerance scales with length: one slip in `beta`, up to three in
@@ -426,9 +535,28 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Build the context an engine hands to `resolve`, with the system values that
 /// are not part of the message body. Kept here so tests and `main` agree.
-pub fn with_system(ctx: &mut Context, channel: &str, channel_idx: u8) {
+///
+/// The message metadata is injected here rather than parsed, so a template can
+/// read `{{hops}}`, `{{delay}}`, `{{snr}}`, `{{sender_timestamp}}` and
+/// `{{repeaters}}` without any of them being message-supplied.
+pub fn with_system(ctx: &mut Context, channel: &str, channel_idx: u8, meta: &MessageMeta) {
     ctx.set_system("channel", Value::Word(channel.to_string()));
     ctx.set_system("channel_idx", Value::Int(i64::from(channel_idx)));
+    ctx.set_system("hops", Value::Int(i64::from(meta.path_len)));
+    // A sender whose clock runs ahead would otherwise produce a negative delay,
+    // which reads as nonsense on the air.
+    ctx.set_system(
+        "delay",
+        Value::Int(i64::from(meta.now.saturating_sub(meta.sender_timestamp))),
+    );
+    ctx.set_system(
+        "sender_timestamp",
+        Value::Int(i64::from(meta.sender_timestamp)),
+    );
+    if let Some(snr) = meta.snr {
+        ctx.set_system("snr", Value::Float(f64::from(snr)));
+    }
+    ctx.set_system("repeaters", Value::Str(meta.repeaters.clone()));
 }
 
 #[cfg(test)]
@@ -438,7 +566,7 @@ mod tests {
 
     fn status_action() -> ActionSpec {
         ActionSpec {
-            script: "status.sh".into(),
+            script: Some("status.sh".into()),
             reply: "{{stdout}}".into(),
             timeout_secs: Some(8),
             ..ActionSpec::default()
@@ -447,7 +575,7 @@ mod tests {
 
     fn mutating_action(confirm: bool) -> ActionSpec {
         ActionSpec {
-            script: "pve-reboot.sh".into(),
+            script: Some("pve-reboot.sh".into()),
             args: vec!["{{target}}".into()],
             env: vec!["PVE_NODE".into()],
             mutating: true,
@@ -603,12 +731,14 @@ mod tests {
         for verb in &table.verbs {
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
             for action in actions {
-                assert!(!action.script.is_empty(), "{} has no script", verb.name);
-                assert!(
-                    !action.script.contains('/'),
-                    "{} script must be a bare name",
-                    verb.name
-                );
+                if let Some(script) = &action.script {
+                    assert!(!script.is_empty(), "{} has no script", verb.name);
+                    assert!(
+                        !script.contains('/'),
+                        "{} script must be a bare name",
+                        verb.name
+                    );
+                }
                 for arg in &action.args {
                     assert!(
                         !arg.contains('/') && !arg.contains('"'),
@@ -840,6 +970,165 @@ mod tests {
         assert_eq!(replies[3], "4/4 stack s4 unhealthy");
     }
 
+    // ---- numbered splitting of one over-long message
+
+    #[test]
+    fn a_short_message_is_not_split() {
+        assert_eq!(
+            split_numbered("ping: 1s, 0 hops | ?", MAX_REPLY_BYTES),
+            ["ping: 1s, 0 hops | ?"]
+        );
+    }
+
+    #[test]
+    fn an_over_long_message_splits_into_numbered_fragments() {
+        let chain = (0..40)
+            .map(|i| format!("NODE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" > ");
+        let text = format!("ping: 12s, 40 hops | {chain}");
+        assert!(text.len() > MAX_REPLY_BYTES);
+
+        let parts = split_numbered(&text, MAX_REPLY_BYTES);
+        assert!(parts.len() >= 2, "{parts:?}");
+        for (i, part) in parts.iter().enumerate() {
+            assert!(
+                part.len() <= MAX_REPLY_BYTES,
+                "{part:?} is {} bytes",
+                part.len()
+            );
+            assert!(
+                part.starts_with(&format!("{}/{} ", i + 1, parts.len())),
+                "{part:?}"
+            );
+        }
+
+        // No word was cut in half: the payloads rejoin to the original tokens.
+        let payload: Vec<&str> = parts
+            .iter()
+            .map(|p| p.split_once(' ').map(|(_, rest)| rest).unwrap_or(""))
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert_eq!(
+            payload,
+            text.split_whitespace().collect::<Vec<_>>(),
+            "a fragment dropped or mangled a word"
+        );
+    }
+
+    #[test]
+    fn a_single_token_wider_than_a_fragment_is_cut() {
+        let token = "A".repeat(MAX_REPLY_BYTES * 2);
+        let parts = split_numbered(&token, MAX_REPLY_BYTES);
+        assert!(parts.len() >= 2, "{parts:?}");
+        for part in &parts {
+            assert!(part.len() <= MAX_REPLY_BYTES, "{} bytes", part.len());
+        }
+        let payload: String = parts
+            .iter()
+            .map(|p| p.split_once(' ').map(|(_, rest)| rest).unwrap_or(""))
+            .collect();
+        assert_eq!(payload, token, "the token was not reassembled exactly");
+    }
+
+    #[test]
+    fn a_very_long_message_is_capped_with_a_truncation_marker() {
+        let text = (0..400)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parts = split_numbered(&text, MAX_REPLY_BYTES);
+        assert_eq!(parts.len(), MAX_REPLIES, "{parts:?}");
+        for part in &parts {
+            assert!(
+                part.len() <= MAX_REPLY_BYTES,
+                "{} bytes: {part}",
+                part.len()
+            );
+        }
+        assert!(
+            parts.last().unwrap().contains("more"),
+            "no truncation marker: {:?}",
+            parts.last()
+        );
+    }
+
+    #[test]
+    fn an_over_long_single_reply_is_split_not_truncated() {
+        let text = (0..40)
+            .map(|i| format!("NODE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" > ");
+        let parts = split_reply(&text);
+        assert!(parts.len() >= 2, "{parts:?}");
+        assert!(parts[0].starts_with("1/"), "{:?}", parts[0]);
+    }
+
+    // ---- injected message metadata
+
+    #[test]
+    fn with_system_injects_the_message_metadata() {
+        let mut ctx = parse::parse("ping").unwrap();
+        let meta = crate::parse::MessageMeta {
+            path_len: 3,
+            snr: Some(7.5),
+            sender_timestamp: 1000,
+            repeaters: "A > B > C".into(),
+            now: 1012,
+        };
+        with_system(&mut ctx, "#admin", 3, &meta);
+
+        assert_eq!(crate::script::expand("{{hops}}", &ctx, None).unwrap(), "3");
+        assert_eq!(
+            crate::script::expand("{{delay}}", &ctx, None).unwrap(),
+            "12"
+        );
+        assert_eq!(
+            crate::script::expand("{{repeaters}}", &ctx, None).unwrap(),
+            "A > B > C"
+        );
+        assert_eq!(crate::script::expand("{{snr}}", &ctx, None).unwrap(), "7.5");
+        assert_eq!(
+            crate::script::expand("{{sender_timestamp}}", &ctx, None).unwrap(),
+            "1000"
+        );
+    }
+
+    /// A sender whose clock is ahead must read as `0s`, not a negative delay.
+    #[test]
+    fn a_sender_ahead_of_us_yields_zero_delay() {
+        let mut ctx = parse::parse("ping").unwrap();
+        let meta = crate::parse::MessageMeta {
+            sender_timestamp: 2000,
+            now: 1000,
+            ..crate::parse::MessageMeta::default()
+        };
+        with_system(&mut ctx, "#admin", 3, &meta);
+        assert_eq!(crate::script::expand("{{delay}}", &ctx, None).unwrap(), "0");
+    }
+
+    /// The metadata is reserved, so a relayed message cannot pre-empt it; and
+    /// even if it could, `with_system` runs last and overwrites.
+    #[test]
+    fn a_message_cannot_spoof_the_metadata() {
+        let mut ctx = parse::parse("ping hops=99 delay=1 repeaters=x").unwrap();
+        assert!(ctx.is_poisoned("hops"));
+        assert!(ctx.is_poisoned("delay"));
+        assert!(ctx.is_poisoned("repeaters"));
+
+        let meta = crate::parse::MessageMeta {
+            path_len: 2,
+            now: 100,
+            ..crate::parse::MessageMeta::default()
+        };
+        with_system(&mut ctx, "#admin", 3, &meta);
+        assert_eq!(crate::script::expand("{{hops}}", &ctx, None).unwrap(), "2");
+        assert_eq!(
+            crate::script::expand("{{delay}}", &ctx, None).unwrap(),
+            "100"
+        );
+    }
+
     #[test]
     fn every_help_line_fits_the_airtime_budget() {
         for topic in ["alarm", "garage", "internet", "reboot", "help"] {
@@ -870,11 +1159,12 @@ mod tests {
             let verb = table.get(name).unwrap();
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
             for action in actions {
-                assert!(
-                    TEMPLATES.contains(&action.script.as_str()),
-                    "{name} runs {:?}, which has no template",
-                    action.script
-                );
+                if let Some(script) = &action.script {
+                    assert!(
+                        TEMPLATES.contains(&script.as_str()),
+                        "{name} runs {script:?}, which has no template"
+                    );
+                }
             }
         }
     }
@@ -905,12 +1195,12 @@ mod tests {
             let verb = table.get(name).unwrap();
             let actions = verb.get.iter().chain(verb.args.iter().map(|a| &a.action));
             for action in actions {
-                let needs = action.script.starts_with("ha-")
-                    || action.script.starts_with("komodo")
-                    || action.script.starts_with("pve-");
+                let needs = action.script.as_deref().is_some_and(|s| {
+                    s.starts_with("ha-") || s.starts_with("komodo") || s.starts_with("pve-")
+                });
                 assert!(
                     !needs || !action.env.is_empty(),
-                    "{name} runs {} with no env allowlist",
+                    "{name} runs {:?} with no env allowlist",
                     action.script
                 );
             }
