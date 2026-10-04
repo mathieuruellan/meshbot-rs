@@ -4,7 +4,7 @@
 # the action scripts need, so there is no compiler, no cargo registry and no
 # source in the published image.
 
-ARG RUST_VERSION=1.98
+ARG RUST_VERSION=1.99
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
 WORKDIR /src

@@ -3,7 +3,7 @@
 # 1.85 or newer.
 #
 # Keep `channel` in step with `ARG RUST_VERSION` in the Dockerfile: the image
-# pins a minor (`rust:1.98-slim-bookworm`) and this pins the exact patch. They
+# pins a minor (`rust:1.99-slim-bookworm`) and this pins the exact patch. They
 # cannot read each other, so that pair is the one duplication in the repo.
 [toolchain]
 channel = "1.99.0"

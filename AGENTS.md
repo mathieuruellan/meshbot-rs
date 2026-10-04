@@ -245,11 +245,11 @@ Two consequences worth knowing before editing the workflows:
   settings, or the job can be bypassed.
 
 The toolchain is pinned three times and none of the three can read each other:
-`rust-toolchain.toml` (`channel = "1.98.1"`, which also gives local builds the
+`rust-toolchain.toml` (`channel = "1.99.0"`, which also gives local builds the
 same compiler CI uses), `ARG RUST_VERSION` in the Dockerfile (a minor, since
-the tag is `rust:1.98-slim-bookworm`), and `dtolnay/rust-toolchain@1.98.1` in the
+the tag is `rust:1.99-slim-bookworm`), and `dtolnay/rust-toolchain@1.99.0` in the
 `checks` job. Bump them together — Renovate does it in one PR, see below. Current
-stable Rust is 1.98.1; edition 2024 needs 1.85 or newer.
+stable Rust is 1.99.0; edition 2024 needs 1.85 or newer.
 
 ### Renovate
 `renovate.json` at the repo root, run by `.github/workflows/renovate.yml` on
@@ -270,9 +270,9 @@ image.
 - **The toolchain is the exception to "one dependency, one PR".** Those three
   pins are three different dependency names, which Renovate cannot group on its
   own, so `renovate.json` gives all three a shared `groupName`. The result moves
-  `1.98.1` → `1.99.0` and `1.98` → `1.99` in a single PR. It is deliberately
+  `1.99.0` → `1.100.0` and `1.99` → `1.100` in a single PR. It is deliberately
   *not* a regex customManager: the `rust-version` datasource returns only
-  three-component versions, so it would either skip the Dockerfile's `1.98` or
+  three-component versions, so it would either skip the Dockerfile's `1.99` or
   coerce it to `1.99.0`, which is not a real `rust:` tag.
 - **`pest` and `pest_derive` are grouped for a hard reason.** `pest` pins
   `pest_derive` to an exact version, and `cargo build --locked` in the
