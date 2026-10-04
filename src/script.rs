@@ -233,7 +233,7 @@ fn spawn_child(command: &mut Command) -> std::io::Result<tokio::process::Child> 
 fn spawn_child(command: &mut Command) -> std::io::Result<tokio::process::Child> {
     use std::sync::atomic::Ordering;
     let armed = SPAWN_FAILURES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
             left.checked_sub(1)
         })
         .is_ok();
