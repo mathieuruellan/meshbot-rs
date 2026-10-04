@@ -395,6 +395,24 @@ Real API in use:
 primitive that allows async work per message, and the whole rule engine depends
 on that.
 
+**Never resolve a hop name through `meshcore.get_contact_by_prefix()` or
+`meshcore.contacts()`.** Both read the cache that `setup_event_handlers()`
+maintains, and its `EventType::Contacts` handler does `map.clear()` before
+inserting the payload. The payload is a **delta, not the book**: the radio
+answers `GET_CONTACTS` with only the contacts modified since the `lastmod` the
+request carried, and the proxy forwards every client's frames to every other
+client, so mc-webui's incremental poll reaches the bot as a one-contact event
+and empties the cache minutes after each connect. Nothing is logged when that
+happens, so it reads as a working bot that has simply never heard of a repeater:
+every `{{repeaters}}` chain renders as hex. `meshcore_py`'s equivalent handler
+upserts instead of clearing, which is what makes this a crate bug rather than a
+protocol rule.
+
+`contact_book::ContactBook` is the replacement: seeded once from
+`meshcore.contacts()` immediately after `ensure_contacts()` builds it, then fed
+by `drain_contacts()` on every contact event and never cleared. Keep it that
+way — a book that shrinks to the size of the last delta is the bug again.
+
 Before changing any `meshcore-rs` call, read the vendored source rather than
 trusting docs.rs or the README.
 
@@ -552,8 +570,11 @@ Recorded so implementation doesn't relitigate them.
   hash-size code, `0xFF` = direct), so it goes through `hop_count()`. The
   repeater chain is **not** in `ChannelMessage`; it is read from the `LOG_DATA`
   RF log the radio pushes immediately before the fetched message, matched on hop
-  count and a short freshness window. Each hop resolves to a contact name when
-  the radio has one and its hex id otherwise. An uncorrelated path renders `?`,
+   count and a short freshness window. Each hop resolves to a contact name when
+   the radio has one and its hex id otherwise, through
+   `contact_book::ContactBook` — not through the crate's cache, which is
+   unusable for this (see the `meshcore-rs` section). An uncorrelated path
+   renders `?`,
   a correlated zero-hop message renders `direct`, and a real chain renders
   `A > B > C`.
 - **`hop_count()` masks a meshcore-rs 0.2.0 gap.** The crate decodes the packed
