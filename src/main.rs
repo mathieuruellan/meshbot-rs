@@ -10,6 +10,7 @@
 //! at startup. See `config`.
 
 mod config;
+mod contact_book;
 mod latch;
 mod parse;
 mod script;
@@ -19,8 +20,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use futures::StreamExt;
-use meshcore_rs::{EventPayload, MeshCore, PayloadType};
+use contact_book::ContactBook;
+use futures::{Stream, StreamExt};
+use meshcore_rs::{EventPayload, MeshCore, MeshCoreEvent, PayloadType};
 use parse::ParseError;
 
 /// How long to wait between read-only liveness probes of the radio.
@@ -124,8 +126,35 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
     // Best effort: the hop hashes in the RF log resolve to names only when the
     // repeater is a contact. A radio that will not hand over its contact list
     // must not stop the bot; unresolved hops fall back to their hex id.
+    //
+    // The crate's own cache cannot serve that lookup. Its `EventType::Contacts`
+    // handler replaces the map wholesale, while the radio answers `GET_CONTACTS`
+    // with only the contacts modified since the requested `lastmod` — and the
+    // proxy forwards every client's frames to every other client, so mc-webui's
+    // incremental poll arrives here as a one-contact event and empties the cache
+    // minutes after each connect. `contacts` is this bot's book: it only ever
+    // grows, and its drain is watching before the seed below asks for the list.
+    let contacts = ContactBook::default();
+    let _drain = DrainGuard(Some(tokio::spawn(drain_contacts(
+        contacts.clone(),
+        meshcore.event_stream(),
+    ))));
+
     match meshcore.ensure_contacts().await {
-        Ok(()) => tracing::debug!("contact cache loaded for path name resolution"),
+        Ok(()) => {
+            // `ensure_contacts` built the crate's map in this very task, so
+            // reading it back is the moment the whole list is known to be there.
+            // The drain keeps this book growing afterwards, for a repeater the
+            // radio learns about after the bot connected.
+            contacts
+                .upsert_all(meshcore.contacts().await.into_values())
+                .await;
+            if contacts.is_empty().await {
+                tracing::warn!("contact book is empty; hop ids stay hex");
+            } else {
+                tracing::info!(contacts = contacts.len().await, "contact book loaded");
+            }
+        }
         Err(err) => tracing::warn!(%err, "could not load contacts; hop ids stay hex"),
     }
 
@@ -209,12 +238,7 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
                             Some(p) if !p.hashes.is_empty() => {
                                 let mut names = Vec::with_capacity(p.hashes.len());
                                 for hash in &p.hashes {
-                                    names.push(
-                                        meshcore
-                                            .get_contact_by_prefix(hash)
-                                            .await
-                                            .map(|c| c.adv_name),
-                                    );
+                                    names.push(contacts.lookup_prefix(hash).await.map(|c| c.adv_name));
                                 }
                                 render_repeaters(&p.hashes, &names)
                             }
@@ -283,6 +307,36 @@ async fn radio_is_alive(meshcore: &MeshCore) -> Result<()> {
 async fn disconnect(meshcore: &MeshCore) {
     if let Err(err) = meshcore.disconnect().await {
         tracing::warn!(%err, "disconnect failed");
+    }
+}
+
+/// Feed [`ContactBook`] from every contact event the radio pushes.
+///
+/// Separate from the message loop deliberately: that loop awaits script actions
+/// inline, and the broadcast stream only holds 256 events, so a run long enough
+/// would drop contact updates the book has no other way to see.
+async fn drain_contacts(book: ContactBook, mut events: impl Stream<Item = MeshCoreEvent> + Unpin) {
+    while let Some(event) = events.next().await {
+        match event.payload {
+            EventPayload::Contacts(contacts) => book.upsert_all(contacts).await,
+            EventPayload::Contact(contact) => book.upsert_one(contact).await,
+            _ => {}
+        }
+    }
+}
+
+/// Stops the contact drain when its connection ends.
+///
+/// Dropping a `MeshCore` does not stop the tasks it started — see [`disconnect`]
+/// — so without this every reconnect would leave one more task holding a stream
+/// whose dispatcher is still alive.
+struct DrainGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
