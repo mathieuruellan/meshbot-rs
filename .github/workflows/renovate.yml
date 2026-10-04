@@ -34,6 +34,9 @@ jobs:
         env:
           RENOVATE_AUTODISCOVER: 'true'
           RENOVATE_AUTODISCOVER_FILTER: 'mathieuruellan/meshbot-rs'
-          # Empty on a schedule, so this resolves to 'extract' there and to
-          # 'lookup' only for a dispatched dry run.
-          RENOVATE_DRY_RUN: ${{ inputs.dry_run && 'lookup' || 'extract' }}
+          # Empty everywhere except a dispatched dry run: Renovate skips an
+          # empty env value, so an empty string means a full run (branches,
+          # PRs, the Dependency Dashboard issue). The old fallback was
+          # 'extract', which made every run - including this cron - a dry run
+          # that stops after the dependency scan and creates nothing.
+          RENOVATE_DRY_RUN: ${{ inputs.dry_run && 'lookup' || '' }}
