@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.7.0...v0.7.1) (2026-10-04)
+
+
+### Bug Fixes
+
+* adopt rust 1.99 toolchain and drop deprecated fetch_update ([1b50bc9](https://github.com/mathieuruellan/meshbot-rs/commit/1b50bc9f11b803e354f3a167c0bde2a7b52bae48))
+* **ci:** run renovate for real instead of as a dry run ([b4155c3](https://github.com/mathieuruellan/meshbot-rs/commit/b4155c30bf9c7da67cef90ff1cd8005f48754401))
+* keep hop names resolving after another client polls contacts ([18d312c](https://github.com/mathieuruellan/meshbot-rs/commit/18d312c220809277621c89539b7035520ebcceab))
+* keep hop names resolving after another client polls contacts ([fe43e22](https://github.com/mathieuruellan/meshbot-rs/commit/fe43e229e6dc3d17ec500f5ac79d6887b10cc59a))
+
 ## [0.7.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.6.1...v0.7.0) (2026-10-03)
 
 
