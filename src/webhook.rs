@@ -111,19 +111,15 @@ impl Webhook {
         }
     }
 
-    /// The name the radio holds for `channel_idx`, if it is a monitored channel.
-    fn name_of(&self, channel_idx: u8) -> Option<&str> {
-        self.channels
-            .iter()
-            .find(|c| c.index == channel_idx)
-            .map(|c| c.name.as_str())
-    }
-
-    /// The monitored indices, for an error that has to be actionable.
+    /// The monitored channels, for an error that has to be actionable.
+    ///
+    /// Index and name together, not the index alone: a caller that addressed the
+    /// channel by name and got a `404` would be told the answer in a spelling it did
+    /// not use, and has to call `GET /channels` to learn what it should have said.
     fn known(&self) -> String {
         self.channels
             .iter()
-            .map(|c| c.index.to_string())
+            .map(|c| format!("{} {}", c.index, c.name))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -137,10 +133,14 @@ impl Webhook {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendBody {
-    /// Radio channel index. A number rather than a name because the radio truncates a
-    /// name to 31 bytes, so the two spellings can differ — `GET /channels` returns the
-    /// mapping.
-    channel: u8,
+    /// Radio channel index. Exactly one of this and `channel_name` is required. The
+    /// index is the exact spelling: the radio truncates a name to 31 bytes, so a name
+    /// can differ from what `GET /channels` returns for it.
+    channel_idx: Option<u8>,
+    /// Channel name, matched against `GET /channels` after trimming surrounding
+    /// whitespace. A name the bot does not monitor is a `404`, not a `400`: the body
+    /// is well formed, the target is simply not one this bot may post on.
+    channel_name: Option<String>,
     message: String,
 }
 
@@ -196,17 +196,36 @@ async fn send_message(
 
     // Checked before the queue, so a refused message never occupies a slot and never
     // becomes work the connection task has to unwind.
-    let Some(name) = webhook.name_of(body.channel) else {
+    let found = match (body.channel_idx, body.channel_name.as_deref()) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "exactly one of channel_idx and channel_name is required".to_string(),
+            });
+        }
+        (Some(idx), None) => webhook.channels.iter().find(|c| c.index == idx),
+        // Trimmed, because a name arrives by copy-paste and the stray space is not
+        // what the caller meant to ask about. The 404 below still echoes it verbatim:
+        // that is what lets a caller see the space that caused the miss. Exact
+        // otherwise, so this stays the same matching `verify_channels` asserts — one
+        // spelling of a name, not two rules for "is this channel real" and "may I
+        // post here".
+        (None, Some(name)) => webhook.channels.iter().find(|c| c.name == name.trim()),
+    };
+    let Some(channel) = found else {
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             message: format!(
                 "channel {} is not monitored; GET /channels lists {}",
-                body.channel,
+                body.channel_idx
+                    .map(|i| i.to_string())
+                    .or(body.channel_name)
+                    .unwrap_or_default(),
                 webhook.known()
             ),
         });
     };
-    let name = name.to_string();
+    let (channel_idx, name) = (channel.index, channel.name.clone());
 
     let message = body.message.trim();
     if message.is_empty() {
@@ -229,7 +248,7 @@ async fn send_message(
 
     let (done, reported) = oneshot::channel();
     let request = SendRequest {
-        channel_idx: body.channel,
+        channel_idx,
         text: message.to_string(),
         done,
     };
@@ -250,7 +269,7 @@ async fn send_message(
 
     match tokio::time::timeout(SEND_TIMEOUT, reported).await {
         Ok(Ok(Ok(()))) => Ok(Json(SentBody {
-            channel: body.channel,
+            channel: channel_idx,
             name,
             bytes,
         })),
@@ -358,8 +377,20 @@ mod tests {
     /// under test here is the policy, and `deny_unknown_fields` is serde's.
     fn body(channel: u8, message: &str) -> Result<Json<SendBody>, JsonRejection> {
         Ok(Json(SendBody {
-            channel,
+            channel_idx: Some(channel),
+            channel_name: None,
             message: message.to_string(),
+        }))
+    }
+
+    fn named(
+        channel_name: Option<&str>,
+        channel_idx: Option<u8>,
+    ) -> Result<Json<SendBody>, JsonRejection> {
+        Ok(Json(SendBody {
+            channel_idx,
+            channel_name: channel_name.map(str::to_string),
+            message: "hello".to_string(),
         }))
     }
 
@@ -427,12 +458,111 @@ mod tests {
             .expect_err("channel 1 is not monitored");
 
         assert_eq!(error.status, StatusCode::NOT_FOUND);
-        // The error has to say what *is* allowed, or the caller has to guess.
-        assert!(error_text(error).await.contains("0, 3"));
+        // The error has to say what *is* allowed, or the caller has to guess — in the
+        // spelling they can use, so both the index and the name.
+        assert!(error_text(error).await.contains("0 #bot, 3 #admin"));
         assert!(
             rx.try_recv().is_err(),
             "a refused channel must not be queued"
         );
+    }
+
+    #[tokio::test]
+    async fn a_channel_can_be_addressed_by_name() {
+        let (webhook, mut rx) = harness();
+        let caller = tokio::spawn(send_message(State(webhook), named(Some("#admin"), None)));
+        let request = rx.recv().await.expect("a request is queued");
+        assert_eq!(request.channel_idx, 3);
+        request.done.send(Ok(())).expect("caller is still waiting");
+        assert_eq!(
+            caller
+                .await
+                .expect("handler does not panic")
+                .expect("accepted")
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_name_is_a_404() {
+        let (webhook, mut rx) = harness();
+        let error = send_message(State(webhook), named(Some("#nope"), None))
+            .await
+            .expect_err("unknown name");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert!(error_text(error).await.contains("0 #bot, 3 #admin"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_exists_but_is_not_monitored_is_refused_by_name() {
+        let (webhook, mut rx) = harness();
+
+        // "#family" is a real channel on the radio and belongs to the phone app and
+        // the family. Addressing it by name must not become a way to post on it — the
+        // index form of this is refused above, and the name form is the new path.
+        let error = send_message(State(webhook), named(Some("#family"), None))
+            .await
+            .expect_err("#family is not monitored");
+
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused channel must not be queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_is_trimmed_before_it_is_matched() {
+        let (webhook, mut rx) = harness();
+
+        // A name arrives by copy-paste; the stray spaces are not the question.
+        let caller = tokio::spawn(send_message(
+            State(webhook),
+            named(Some("  #admin  "), None),
+        ));
+        let request = rx.recv().await.expect("a request is queued");
+        assert_eq!(request.channel_idx, 3);
+        request.done.send(Ok(())).expect("caller is still waiting");
+        assert_eq!(
+            caller
+                .await
+                .expect("handler does not panic")
+                .expect("accepted")
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_misses_is_echoed_verbatim() {
+        let (webhook, _rx) = harness();
+
+        // The trimmed name is what gets matched, but the 404 quotes what was sent —
+        // otherwise a caller whose stray whitespace caused the miss is told
+        // `#family is not monitored` when they never asked about `#family`.
+        let error = send_message(State(webhook), named(Some(" #family "), None))
+            .await
+            .expect_err("#family is not monitored");
+        assert!(
+            error_text(error)
+                .await
+                .contains("channel  #family  is not monitored")
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_one_of_idx_and_name_is_required() {
+        for (name, idx) in [(None, None), (Some("#bot"), Some(0))] {
+            let (webhook, _rx) = harness();
+            let error = send_message(State(webhook), named(name, idx))
+                .await
+                .expect_err("ambiguous or missing channel");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

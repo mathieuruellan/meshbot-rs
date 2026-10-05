@@ -207,7 +207,7 @@ One HTTP listener, two routes, off unless `MESHBOT_HTTP_ADDR` is set:
 | route | does |
 |---|---|
 | `GET /channels` | the `bot.channels` listen set, as `[{index, name}]` |
-| `POST /message` | `{"channel": <index>, "message": "…"}` — put it on the air |
+| `POST /message` | `{"channel_idx": <index> \| "channel_name": "<name>", "message": "…"}` — exactly one of the two; unknown → 404 — put it on the air |
 
 `POST` is answered by the radio, not by the handler: a `200` means the radio
 accepted the message, a `502` means it did not, a `504` means it did not answer
@@ -225,7 +225,12 @@ Four decisions, none of them defaults:
   standing between a misconfiguration and a write capability.
 - **It can only aim at a monitored channel.** The target is resolved against
   `bot.channels`, the same map that filters inbound messages and that
-  `verify_channels` asserts against the radio. So the webhook's reach is exactly
+  `verify_channels` asserts against the radio. A name is matched against that map
+  **after trimming** surrounding whitespace — a name arrives by copy-paste and the
+  stray space is not the question — but the `404` echoes it verbatim, so a caller
+  whose stray whitespace caused the miss can see it. The `404` names both the index
+  and the name of every monitored channel, so the answer comes back in the spelling
+  the caller used. So the webhook's reach is exactly
   the bot's listen set, it moves only when `config.yaml` does, and it can never
   reach a channel the bot ignores — including the ones mc-webui owns. It sends
   no `SET_CHANNEL`, so it cannot create one either.
@@ -260,13 +265,17 @@ MESHBOT_CONFIG=./config.example.yaml MESHBOT_SCRIPT_DIR=./scripts.example \
   cargo run
 curl -s localhost:18080/channels
 curl -s -X POST localhost:18080/message -H 'content-type: application/json' \
-  -d '{"channel":3,"message":"hello"}'
+  -d '{"channel_idx":3,"message":"hello"}'
+curl -s -X POST localhost:18080/message -H 'content-type: application/json' \
+  -d '{"channel_name":"#family","message":"hello"}'
 ```
 
-The `POST` answers `502 the connection to the radio ended` — correct, and the
+The first `POST` answers `502 the connection to the radio ended` — correct, and the
 thing worth checking: it proves the queue, the drain and the failure path all
 work with no radio attached. A `200` here would mean the message had gone
-somewhere.
+somewhere. The second answers `404`, and it does so without a radio at all: the
+target is checked against `bot.channels` before anything is queued, so a channel
+the bot does not listen to never reaches the sender.
 
 ## CI and releases
 `.github/workflows/ci.yml` and `.github/workflows/release.yml` exist. Three
