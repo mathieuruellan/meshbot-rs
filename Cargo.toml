@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+# The webhook is HTTP in, HTTP out, and the only listener in the crate. It is
+# deliberately unauthenticated: TLS and client-certificate verification are the
+# reverse proxy's job, and a bot holding HA/Komodo/Proxmox tokens is the wrong
+# place to grow a second auth path. See `src/webhook.rs`.
+axum = { version = "0.8.8", default-features = false, features = ["http1", "json", "tokio"] }
 dotenvy = "0.15.7"
 futures = "0.3.34"
 meshcore-rs = { version = "=0.2.0", default-features = false, features = ["tcp"] }
