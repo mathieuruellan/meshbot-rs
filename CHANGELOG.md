@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.7.1...v0.8.0) (2026-10-05)
+
+
+### Features
+
+* **webhook:** address a channel by index or by name ([bc1deda](https://github.com/mathieuruellan/meshbot-rs/commit/bc1deda0dbd469b8f593f15977536eb6954c7065))
+* **webhook:** HTTP endpoint to post on a monitored channel ([31cf0f8](https://github.com/mathieuruellan/meshbot-rs/commit/31cf0f87900f0356137c7c173431efb01738ef4d))
+* **webhook:** HTTP endpoint to post on a monitored channel ([6eb1230](https://github.com/mathieuruellan/meshbot-rs/commit/6eb1230af3dba9ea62268020f84579a3f2a9c4ca))
+
 ## [0.7.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.7.0...v0.7.1) (2026-10-04)
 
 
