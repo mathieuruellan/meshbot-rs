@@ -15,6 +15,7 @@ mod latch;
 mod parse;
 mod script;
 mod verbs;
+mod webhook;
 
 use std::path::Path;
 use std::time::Instant;
@@ -66,12 +67,28 @@ async fn main() -> Result<()> {
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), host = %host, port, "starting");
 
+    // The webhook hands messages to the connection task rather than holding the
+    // radio itself. That is the whole reason it is a queue and not a direct call:
+    // the connection below is expected to end and be rebuilt, and a handle cloned
+    // out here would be a handle to a connection that no longer exists. The sender
+    // is kept alive for the life of the process so `recv` in the loop below never
+    // reports a closed queue when the webhook is switched off.
+    let (webhook_tx, mut webhook_rx) = tokio::sync::mpsc::channel(webhook::QUEUE_DEPTH);
+    if let Some(addr) = webhook::listen_addr()? {
+        let state = webhook::Webhook::new(webhook_tx.clone(), &loaded.channels);
+        tokio::spawn(webhook::serve(addr, state));
+    }
+
     // The connection is not expected to last: the radio can be power-cycled and
     // the proxy restarted under it. Every connection re-runs the clock sync and
     // the channel assertion, so recovery is a reconnect, not a container restart.
     loop {
-        match run_connection(&host, port, &loaded).await {
+        match run_connection(&host, port, &loaded, &mut webhook_rx).await {
             Ended::Reconnect(err) => {
+                // Anything still queued belongs to a connection that is gone. Fail it
+                // now rather than let the next connection transmit it to a caller
+                // that has already given up and may have retried.
+                webhook::fail_pending(&mut webhook_rx, "the connection to the radio ended");
                 tracing::warn!(%err, delay = ?RECONNECT_DELAY, "connection lost; reconnecting");
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
@@ -98,7 +115,17 @@ enum Ended {
 /// [`main`]. The latch is created here, per connection, so a reconnect disarms
 /// any pending confirmation: a two-step action must be re-issued against the
 /// connection that armed it.
-async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended {
+///
+/// `webhook_rx` is why this function owns the radio rather than the other way
+/// round. It is the only holder of the `MeshCore` handle, so a message queued by
+/// the webhook can only be sent here — which is what makes the webhook survive the
+/// reconnect this function exists to handle.
+async fn run_connection(
+    host: &str,
+    port: u16,
+    loaded: &config::Loaded,
+    webhook_rx: &mut tokio::sync::mpsc::Receiver<webhook::SendRequest>,
+) -> Ended {
     let meshcore = match MeshCore::tcp(host, port).await {
         Ok(meshcore) => meshcore,
         Err(err) => return Ended::Reconnect(err.into()),
@@ -281,6 +308,46 @@ async fn run_connection(host: &str, port: u16, loaded: &config::Loaded) -> Ended
                     return Ended::Reconnect(err);
                 }
                 tracing::debug!("radio liveness probe ok");
+            }
+            // A webhook message, once everything ahead of it in this loop is done.
+            // Sharing the loop is the point: the bot already guarantees one message
+            // is resolved, executed and answered before the next is read, and a
+            // second sender on the radio would break that for the sake of an HTTP
+            // endpoint.
+            queued = webhook_rx.recv() => {
+                // `None` only if every sender is dropped, which `main` prevents by
+                // holding one for the life of the process.
+                let Some(request) = queued else {
+                    continue;
+                };
+                let outcome = {
+                    let commands = meshcore.commands().lock().await;
+                    commands
+                        .send_channel_msg(request.channel_idx, &request.text, None)
+                        .await
+                };
+                let reported = match &outcome {
+                    Ok(()) => {
+                        tracing::info!(
+                            channel_idx = request.channel_idx,
+                            bytes = request.text.len(),
+                            "webhook message sent"
+                        );
+                        Ok(())
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            channel_idx = request.channel_idx,
+                            %err,
+                            "webhook message not sent"
+                        );
+                        Err(err.to_string())
+                    }
+                };
+                // The caller may have timed out or hung up already. That is not an
+                // error here: the message is sent or it is not, and there is no
+                // retry either way, because a retry would put it on the air twice.
+                let _ = request.done.send(reported);
             }
         }
     }

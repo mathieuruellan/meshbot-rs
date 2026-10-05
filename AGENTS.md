@@ -22,7 +22,10 @@ replies on the air — one message per line of the reply. The config loader
 and is validated by the test suite; the verb table, the channel map and the script
 directory all come from `config.yaml`. It also owns the radio clock
 (`set_radio_clock`) and polls the radio for liveness, redialling when it stops
-answering (`run_connection` / `radio_is_alive`). Do not assume a feature exists
+answering (`run_connection` / `radio_is_alive`). It has one optional HTTP
+listener — a webhook that posts a message on a channel the bot already listens
+to (`src/webhook.rs`, off unless `MESHBOT_HTTP_ADDR` is set) — which is the only
+way to make the bot speak without a mesh message. Do not assume a feature exists
 because it is described below — check `src/`.
 
 ## Build
@@ -197,6 +200,82 @@ they measure the deadline, and waiting on EOF instead would make them 30-second
 tests. The fix is either a process group (`process_group(0)` at spawn, `killpg`
 at the deadline) or a bounded drain that keeps whatever was captured; undecided,
 and no tracked script backgrounds anything.
+
+## The webhook
+One HTTP listener, two routes, off unless `MESHBOT_HTTP_ADDR` is set:
+
+| route | does |
+|---|---|
+| `GET /channels` | the `bot.channels` listen set, as `[{index, name}]` |
+| `POST /message` | `{"channel_idx": <index> \| "channel_name": "<name>", "message": "…"}` — exactly one of the two; unknown → 404 — put it on the air |
+
+`POST` is answered by the radio, not by the handler: a `200` means the radio
+accepted the message, a `502` means it did not, a `504` means it did not answer
+within 10s. The queue in front of the radio holds 16 messages and a full one is
+a `503`, never a wait.
+
+Four decisions, none of them defaults:
+
+- **No authentication of its own.** No token, no header, no path check. TLS and
+  client-certificate verification are the reverse proxy's job, and the deployment
+  puts an mTLS proxy in front of this. `axum` is the crate's only HTTP
+  dependency and it serves plain HTTP — if a deployment publishes this port
+  directly, every reader of the config can post on the family channels. The
+  listener says so in a `warn!` at startup, and that warning is the only thing
+  standing between a misconfiguration and a write capability.
+- **It can only aim at a monitored channel.** The target is resolved against
+  `bot.channels`, the same map that filters inbound messages and that
+  `verify_channels` asserts against the radio. A name is matched against that map
+  **after trimming** surrounding whitespace — a name arrives by copy-paste and the
+  stray space is not the question — but the `404` echoes it verbatim, so a caller
+  whose stray whitespace caused the miss can see it. The `404` names both the index
+  and the name of every monitored channel, so the answer comes back in the spelling
+  the caller used. So the webhook's reach is exactly
+  the bot's listen set, it moves only when `config.yaml` does, and it can never
+  reach a channel the bot ignores — including the ones mc-webui owns. It sends
+  no `SET_CHANNEL`, so it cannot create one either.
+- **A long message is refused, not shortened.** A reply clamps at 150 bytes
+  because half a sentence beats silence. An API caller asked for a specific
+  message, so it gets `413` and the limit instead of a silently truncated
+  transmission. The limit is bytes, not characters.
+- **The send is shared with the mesh loop, not parallel to it.** `run_connection`
+  owns the only `MeshCore` handle, so a queued request is picked up by the same
+  `select!` that reads channel messages. That is deliberate: the bot guarantees
+  one message is resolved, executed and answered before the next is read, and a
+  second sender on the radio would break that for the sake of an HTTP endpoint.
+
+**Why the queue rather than a handle.** `MeshCore` is not `Clone`, has no `Drop`,
+and is rebuilt on every reconnect. A `CommandHandler` cloned out at startup is a
+handle to a connection that no longer exists, and it fails silently — the request
+goes nowhere and nothing is logged. `main` owns the `mpsc::Sender`, the
+connection task owns the `Receiver`, and so every send follows the reconnect
+cycle by construction.
+
+**A request queued when a connection dies is failed, not deferred.** `main` calls
+`fail_pending` on the reconnect path. Left in the queue it would be transmitted by
+the *next* connection to a caller that has already been told it failed and has
+probably retried — so the message would arrive twice. Failing it is the outcome a
+caller can reason about.
+
+Verify without a radio and without a deploy:
+
+```bash
+MESHBOT_CONFIG=./config.example.yaml MESHBOT_SCRIPT_DIR=./scripts.example \
+  MESHBOT_HTTP_ADDR=127.0.0.1:18080 MESHCORE_HOST=127.0.0.1 MESHCORE_PORT=59999 \
+  cargo run
+curl -s localhost:18080/channels
+curl -s -X POST localhost:18080/message -H 'content-type: application/json' \
+  -d '{"channel_idx":3,"message":"hello"}'
+curl -s -X POST localhost:18080/message -H 'content-type: application/json' \
+  -d '{"channel_name":"#family","message":"hello"}'
+```
+
+The first `POST` answers `502 the connection to the radio ended` — correct, and the
+thing worth checking: it proves the queue, the drain and the failure path all
+work with no radio attached. A `200` here would mean the message had gone
+somewhere. The second answers `404`, and it does so without a radio at all: the
+target is checked against `bot.channels` before anything is queued, so a channel
+the bot does not listen to never reaches the sender.
 
 ## CI and releases
 `.github/workflows/ci.yml` and `.github/workflows/release.yml` exist. Three
@@ -504,7 +583,7 @@ Recorded so implementation doesn't relitigate them.
   `confirm: true`, and `decide()` arms or consumes. A second "held" path would
   be a way to reach a spawn that skips the latch.
 - **`.env`** is gitignored, mounted `:ro`, and is the single source for both
-  context values and `${ENV}` interpolation in config. Webhook IDs and tokens
+  context values and `${ENV}` interpolation in config. Tokens an action needs
   live here, never in git.
 - **Actions**: run a **script**, not an HTTP call. This is the change from the
   earlier HTTP design, and the reason is the same as the enum: the verb declares
@@ -642,6 +721,17 @@ Recorded so implementation doesn't relitigate them.
   service, and the Renovate-managed pin in the `meshcore` repo.
 - **Do not act on a channel outside `CHANNELS`.** The map is the listen set and
   the startup assertion; keep the two identical.
+- **Do not authenticate inside the webhook.** It is deliberately the one
+  unauthenticated surface, on the argument that TLS and client-cert checks belong
+  to the proxy and a second auth path belongs nowhere near the process that holds
+  the HA, Komodo and Proxmox tokens. If a deployment needs a token as well, that
+  is a proxy middleware, not a new branch in `src/webhook.rs`.
+- **Do not widen what the webhook can aim at.** It resolves against `bot.channels`
+  and nothing else. Listing the radio's channels, or posting on one the bot does
+  not listen to, is how a webhook becomes a way to write the radio's channel
+  table by hand.
+- **Do not make the webhook retry.** It shares the no-retries rule with actions:
+  mesh airtime is scarce and a retried message arrives twice.
 - **Do not introduce retries** on actions. Mesh airtime is scarce and a retry
   storm is worse than a missed action.
 - **Do not reintroduce a second gating path.** If something needs to be held for
