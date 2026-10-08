@@ -604,12 +604,11 @@ fn decide<'a>(
     // Channel scope, checked before resolution so it covers every outcome and
     // not just the ones that spawn something. `reboot` belongs to #admin;
     // running it on #homeassistant would be a command on the wrong channel, and
-    // even the read-only replies would be off-limits there.
+    // even the read-only replies would be off-limits there. `help` never lands
+    // here — it is not in the table — but it filters its own list with the same
+    // predicate, so what is advertised and what is refused agree.
     if let Some(verb) = ctx.verb().and_then(|name| table.get(name))
-        && verb
-            .channel
-            .as_deref()
-            .is_some_and(|scope| scope != channel)
+        && !verb.available_on(channel)
     {
         tracing::info!(channel_idx, verb = %verb.name, "verb out of scope here");
         return Decision::Reply(format!("{verb}: not on this channel"));
@@ -663,6 +662,14 @@ fn decide<'a>(
                 "running action"
             );
             Decision::Execute { action, ctx }
+        }
+        // No reply on air, but an operator chasing "why did nothing happen"
+        // needs the dropped word somewhere. Debug rather than info: the parser
+        // is verb-shaped, so every first word of ordinary chat lands here and
+        // an info line per message would bury the ones that matter.
+        verbs::Resolution::UnknownVerb { input } => {
+            tracing::debug!(channel_idx, verb = %input, "unknown verb");
+            Decision::Ignore
         }
         other => match other.into_reply() {
             Some(reply) => Decision::Reply(reply),
@@ -1098,8 +1105,8 @@ mod tests {
 
     // ---- channel scope
 
-    /// `reboot` is declared on #admin. On #homeassistant it must not arm, must
-    /// not run, and must not leak its words through a suggestion.
+    /// `reboot` is declared on #admin. On #homeassistant it must not arm and
+    /// must not run.
     #[test]
     fn a_verb_cannot_run_on_the_wrong_channel() {
         let table = table();
@@ -1130,7 +1137,8 @@ mod tests {
     }
 
     /// `help` is not in the verb table, so it has no scope and must answer
-    /// anywhere — otherwise there is no way to ask what is possible.
+    /// anywhere — otherwise there is no way to ask what is possible. What it
+    /// answers *with* is filtered, which the next test pins down.
     #[test]
     fn help_works_on_either_channel() {
         let table = table();
@@ -1139,6 +1147,47 @@ mod tests {
             let d = run_on(table, &mut latch, "help", channel);
             assert!(d.reply().is_some(), "no help on {channel}");
         }
+    }
+
+    /// The list must be what works *here*: advertising `reboot` on
+    /// #homeassistant is advertising a command that answers `not on this
+    /// channel`.
+    #[test]
+    fn help_lists_only_this_channels_verbs() {
+        let table = table();
+        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+
+        let ha = run_on(table, &mut latch, "help", HA)
+            .reply()
+            .expect("help on the HA channel")
+            .to_string();
+        assert!(ha.contains("alarm"), "{ha}");
+        assert!(ha.contains("garage"), "{ha}");
+        for unreachable in ["reboot", "komodo", "ping", "internet"] {
+            assert!(!ha.contains(unreachable), "{ha}");
+        }
+
+        let admin = run_on(table, &mut latch, "help", ADMIN)
+            .reply()
+            .expect("help on the admin channel")
+            .to_string();
+        for reachable in ["internet", "komodo", "ping", "reboot"] {
+            assert!(admin.contains(reachable), "{admin}");
+        }
+        for unreachable in ["alarm", "garage"] {
+            assert!(!admin.contains(unreachable), "{admin}");
+        }
+    }
+
+    /// A named topic is described wherever it is asked about: help is how you
+    /// learn what a command does *before* you are on the channel that runs it.
+    #[test]
+    fn help_describes_a_verb_of_another_channel() {
+        let table = table();
+        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let d = run_on(table, &mut latch, "help reboot", HA);
+        let reply = d.reply().expect("help answers anywhere");
+        assert!(reply.starts_with("reboot:"), "{reply}");
     }
 
     // ---- reserved-key poisoning
@@ -1195,34 +1244,20 @@ mod tests {
         }
     }
 
-    /// A near-miss earns a pointer; a word that is not a near-miss gets nothing.
-    /// The parser is verb-shaped, not sentence-shaped, so every one-word message
-    /// becomes a verb guess — and these channels are not exclusively ours, so a
-    /// reply to every greeting is a bot talking over itself.
+    /// No word gets an answer, near or far: with the typo pointer gone there is
+    /// nothing left to say to one. The parser is verb-shaped, not
+    /// sentence-shaped, so every one-word message becomes a verb guess — and
+    /// these channels are not exclusively ours, so a reply to every greeting is
+    /// a bot talking over itself.
     #[test]
-    fn only_an_unknown_word_near_a_verb_gets_an_answer() {
+    fn no_unknown_word_gets_an_answer() {
         let table = table();
         let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-
-        // Near enough to `garage` to be worth correcting.
-        let near = run_on(table, &mut latch, "gerage", HA);
-        assert!(near.reply().expect("a pointer").contains("garage"));
-
-        // Not near anything: silence, not a correction nobody asked for.
-        for input in ["hello", "bonjour", "meteo"] {
+        for input in ["gerage", "hello", "bonjour", "meteo"] {
             let d = run_on(table, &mut latch, input, HA);
             assert!(!d.is_execute(), "{input} ran");
             assert_eq!(d.reply(), None, "{input} was answered");
         }
-    }
-
-    #[test]
-    fn a_typo_gets_a_pointer_not_a_rejection() {
-        let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
-        let d = run_on(table, &mut latch, "gerage", HA);
-        let reply = d.reply().expect("a suggestion");
-        assert!(reply.contains("garage"), "{reply}");
     }
 
     #[test]

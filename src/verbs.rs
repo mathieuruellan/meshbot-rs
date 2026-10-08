@@ -111,6 +111,17 @@ impl VerbSpec {
     fn needs_confirm(&self) -> bool {
         self.args.iter().any(|a| a.action.confirm)
     }
+
+    /// Whether this verb answers on `channel`.
+    ///
+    /// The single predicate for channel scope: `decide` refuses an out-of-scope
+    /// command with it, and `help` filters its list with it, so the two can
+    /// never disagree about what is possible where. The loader requires every
+    /// verb to declare a channel, so `None` is only reachable from a table
+    /// built in code — treated as unscoped, which is what `decide` always did.
+    pub fn available_on(&self, channel: &str) -> bool {
+        self.channel.as_deref().is_none_or(|scope| scope == channel)
+    }
 }
 
 /// A verb formats as its own name, so help and confirm prompts read as
@@ -138,25 +149,27 @@ impl VerbTable {
             .find(|v| v.name.to_ascii_lowercase() == name)
     }
 
-    /// Verb names in alphabetical order, for `help`.
+    /// Verb names in alphabetical order, for `help` and the startup log.
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.verbs.iter().map(|v| v.name.as_str()).collect();
         names.sort_unstable();
         names
     }
 
-    /// Nearest verb within a small edit distance, so `gerage` gets a pointer
-    /// instead of a flat rejection. Cheap enough at this table size to run on
-    /// every miss.
-    pub fn suggest(&self, word: &str) -> Option<&str> {
-        let word = word.to_ascii_lowercase();
-        self.verbs
+    /// The names that answer on `channel`, in alphabetical order.
+    ///
+    /// `None` lists everything, which is the startup log's view; `help` passes
+    /// the real channel so its list is what is possible *here* rather than
+    /// everywhere.
+    pub fn names_on(&self, channel: Option<&str>) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .verbs
             .iter()
+            .filter(|v| channel.is_none_or(|c| v.available_on(c)))
             .map(|v| v.name.as_str())
-            .map(|name| (name, edit_distance(&word, name)))
-            .filter(|(name, d)| *d <= tolerance(word.len(), name.len()))
-            .min_by_key(|(_, d)| *d)
-            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// Decide what a parsed message means.
@@ -166,16 +179,26 @@ impl VerbTable {
         };
 
         if verb_name == "help" {
+            // The channel is system-injected by `with_system` before a real
+            // message reaches here, and `decide` drops a poisoned one first, so
+            // this is the channel the message actually arrived on. A context
+            // built without it (the unit tests below) lists every verb.
+            let channel = match ctx.get("channel") {
+                Some(Value::Word(w)) | Some(Value::Str(w)) => Some(w.as_str()),
+                _ => None,
+            };
             return match ctx.target() {
-                Some(topic) => self.help(Some(topic)),
-                None => self.help(None),
+                Some(topic) => self.help(Some(topic), channel),
+                None => self.help(None, channel),
             };
         }
 
         let Some(verb) = self.get(verb_name) else {
+            // No suggestion and so no reply. The parser is verb-shaped, so
+            // every first word of ordinary chat lands here, and answering it
+            // would be a bot talking over the channel.
             return Resolution::UnknownVerb {
                 input: verb_name.to_string(),
-                suggestion: self.suggest(verb_name),
             };
         };
 
@@ -188,7 +211,7 @@ impl VerbTable {
                 },
                 None => Resolution::NoQuery {
                     verb,
-                    suggestion: self.suggest_arg(verb, ""),
+                    suggestion: verb.primary_word(),
                 },
             },
             Some(word) => match verb
@@ -204,39 +227,30 @@ impl VerbTable {
                 None => Resolution::BadArg {
                     verb,
                     input: word.to_string(),
-                    suggestion: self.suggest_arg(verb, word),
                 },
             },
         }
     }
 
-    fn suggest_arg<'a>(&'a self, verb: &'a VerbSpec, word: &str) -> Option<&'a str> {
-        if word.is_empty() {
-            return verb.primary_word();
-        }
-        let word = word.to_ascii_lowercase();
-        verb.args
-            .iter()
-            .flat_map(|a| a.words.iter())
-            .map(String::as_str)
-            .map(|w| (w, edit_distance(&word, &w.to_ascii_lowercase())))
-            .filter(|(w, d)| *d <= tolerance(word.len(), w.len()))
-            .min_by_key(|(_, d)| *d)
-            .map(|(w, _)| w)
-    }
-
     /// `help` / `help <verb>`, clamped to fit a single airtime frame.
-    pub fn help(&self, topic: Option<&str>) -> Resolution<'_> {
+    ///
+    /// The bare list is filtered to `channel`, because listing verbs that
+    /// answer `not on this channel` here advertises commands the sender cannot
+    /// use. A named topic is described wherever it was asked about: help is
+    /// informational, and refusing to describe `reboot` on #homeassistant would
+    /// leave no way to learn what it does before moving to #admin.
+    pub fn help(&self, topic: Option<&str>, channel: Option<&str>) -> Resolution<'_> {
         let Some(topic) = topic else {
-            let line = format!("verbs: {} | try 'help <verb>'", self.names().join(" "));
+            let names = self.names_on(channel);
+            if names.is_empty() {
+                return Resolution::Help("no verbs on this channel".to_string());
+            }
+            let line = format!("verbs: {} | try 'help <verb>'", names.join(" "));
             return Resolution::Help(clamp(&line, MAX_REPLY_BYTES));
         };
 
         let Some(verb) = self.get(topic) else {
-            let line = match self.suggest(topic) {
-                Some(name) => format!("no help for '{topic}' - did you mean: {name}?"),
-                None => format!("no help for '{topic}' - try 'help'"),
-            };
+            let line = format!("no help for '{topic}' - try 'help'");
             return Resolution::Help(clamp(&line, MAX_REPLY_BYTES));
         };
 
@@ -273,16 +287,18 @@ pub enum Resolution<'a> {
     NoVerb,
     NoQuery {
         verb: &'a VerbSpec,
+        /// The verb's own declared word, not a typo correction: what to type
+        /// after it to make the verb act.
         suggestion: Option<&'a str>,
     },
     UnknownVerb {
+        /// The word that matched nothing. It earns no reply, so this is the
+        /// only trace the drop leaves — `decide` logs it.
         input: String,
-        suggestion: Option<&'a str>,
     },
     BadArg {
         verb: &'a VerbSpec,
         input: String,
-        suggestion: Option<&'a str>,
     },
 }
 
@@ -296,26 +312,14 @@ impl<'a> Resolution<'a> {
                 Some(s) => format!("try '{s}' or 'help'"),
                 None => "try 'help'".to_string(),
             }),
-            Self::UnknownVerb { input, suggestion } => {
-                // A near-miss gets a pointer; a word that is not a near-miss gets
-                // silence. The parser is verb-shaped rather than
-                // sentence-shaped, so every one-word message lands here, and
-                // these channels are not exclusively ours — answering "unknown:
-                // 'hello' - try 'help'" to every greeting is a bot that talks
-                // over itself.
-                let suggestion = suggestion?;
-                let line = format!("unknown: '{input}' - did you mean: {suggestion}? | try 'help'");
-                Some(clamp(&line, MAX_REPLY_BYTES))
-            }
-            Self::BadArg {
-                verb,
-                input,
-                suggestion,
-            } => {
-                let line = match suggestion {
-                    Some(s) => format!("{verb}: '{input}'? did you mean: {s}?"),
-                    None => format!("{verb}: '{input}'? try 'help {verb}'"),
-                };
+            // Silence, deliberately, and for every unknown word rather than
+            // only the far ones. The parser is verb-shaped rather than
+            // sentence-shaped, so every first word of ordinary chat lands
+            // here, and these channels are not exclusively ours — a bot that
+            // corrects every greeting talks over the channel.
+            Self::UnknownVerb { .. } => None,
+            Self::BadArg { verb, input } => {
+                let line = format!("{verb}: '{input}'? try 'help {verb}'");
                 Some(clamp(&line, MAX_REPLY_BYTES))
             }
             Self::Fire { .. } => None,
@@ -492,47 +496,6 @@ fn push_within(s: &mut String, suffix: &str, max: usize) {
     s.push_str(suffix);
 }
 
-/// Typo tolerance scales with length: one slip in `beta`, up to three in
-/// `delta`.
-fn tolerance(a: usize, b: usize) -> usize {
-    let longest = a.max(b);
-    match longest {
-        0..=4 => 1,
-        5..=8 => 2,
-        _ => 3,
-    }
-}
-
-/// Optimal string alignment distance: Levenshtein plus adjacent transposition.
-///
-/// The transposition term matters because swapping two adjacent characters is
-/// the most common typo on a phone keyboard, and plain Levenshtein scores
-/// `opne` → `open` as 2 — outside the tolerance for a 4-character word, so
-/// `garage opne` would get a flat rejection instead of the obvious suggestion.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in d.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in d[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            d[i][j] = (d[i - 1][j] + 1)
-                .min(d[i][j - 1] + 1)
-                .min(d[i - 1][j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
-            }
-        }
-    }
-    d[a.len()][b.len()]
-}
-
 /// Build the context an engine hands to `resolve`, with the system values that
 /// are not part of the message body. Kept here so tests and `main` agree.
 ///
@@ -641,12 +604,23 @@ mod tests {
         ])
     }
 
-    fn resolve(input: &str) -> Resolution<'_> {
-        // The table has to outlive the resolution, which borrows from it.
+    /// The shared table every resolution test reads, built once.
+    fn static_table() -> &'static VerbTable {
         static TABLE: std::sync::OnceLock<VerbTable> = std::sync::OnceLock::new();
-        let table = TABLE.get_or_init(table);
+        TABLE.get_or_init(table)
+    }
+
+    fn resolve(input: &str) -> Resolution<'static> {
         let ctx = parse::parse(input).unwrap();
-        table.resolve(&ctx)
+        static_table().resolve(&ctx)
+    }
+
+    /// As [`resolve`], but as the message would arrive: with the channel the
+    /// engine injects, which is what `help` filters its list against.
+    fn resolve_on(input: &str, channel: &str) -> Resolution<'static> {
+        let mut ctx = parse::parse(input).unwrap();
+        with_system(&mut ctx, channel, 3, &parse::MessageMeta::default());
+        static_table().resolve(&ctx)
     }
 
     #[test]
@@ -829,22 +803,23 @@ mod tests {
         }
     }
 
+    /// Silence, not a pointer: no `did you mean` survives anywhere, and the
+    /// parser being verb-shaped means answering here would be answering every
+    /// first word of ordinary chat.
     #[test]
-    fn an_unknown_verb_is_answered_never_ignored() {
-        let reply = resolve("gerage").into_reply().unwrap();
-        assert_eq!(
-            reply,
-            "unknown: 'gerage' - did you mean: garage? | try 'help'"
-        );
+    fn an_unknown_word_gets_no_reply() {
+        assert_eq!(resolve("gerage").into_reply(), None);
         assert!(!resolve("gerage").is_actionable());
     }
 
     #[test]
-    fn a_bad_arg_suggests_the_nearest_word() {
+    fn a_bad_arg_points_at_help_for_the_verb() {
         let reply = resolve("garage opne").into_reply().unwrap();
-        assert_eq!(reply, "garage: 'opne'? did you mean: open?");
+        assert_eq!(reply, "garage: 'opne'? try 'help garage'");
     }
 
+    /// With no channel in the context — the startup view — every verb is
+    /// listed. What a channel sees is [`help_lists_only_the_verbs_of_the_channel`].
     #[test]
     fn help_lists_every_verb_and_fits_one_frame() {
         let reply = resolve("help").into_reply().unwrap();
@@ -853,6 +828,37 @@ mod tests {
             "verbs: alarm garage internet reboot | try 'help <verb>'"
         );
         assert!(reply.len() <= MAX_REPLY_BYTES);
+    }
+
+    /// The whole point of the change: what is listed must be what is possible
+    /// here, or `help` advertises commands that answer `not on this channel`.
+    #[test]
+    fn help_lists_only_the_verbs_of_the_channel() {
+        let ha = resolve_on("help", "#homeassistant").into_reply().unwrap();
+        assert_eq!(ha, "verbs: alarm garage | try 'help <verb>'");
+
+        let admin = resolve_on("help", "#admin").into_reply().unwrap();
+        assert_eq!(admin, "verbs: internet reboot | try 'help <verb>'");
+        assert!(admin.len() <= MAX_REPLY_BYTES);
+    }
+
+    /// `bot.channels` may declare a channel no verb is scoped to; the list must
+    /// not render as `verbs:  | …`.
+    #[test]
+    fn help_on_a_channel_with_no_verbs_says_so() {
+        let reply = resolve_on("help", "#family").into_reply().unwrap();
+        assert_eq!(reply, "no verbs on this channel");
+    }
+
+    /// Help is informational, so a topic is described wherever it was asked
+    /// about — refusing it would leave no way to learn what `reboot` does
+    /// before asking on the channel it belongs to.
+    #[test]
+    fn help_describes_a_verb_of_another_channel() {
+        let reply = resolve_on("help reboot", "#homeassistant")
+            .into_reply()
+            .unwrap();
+        assert!(reply.starts_with("reboot: reboot a host"), "{reply}");
     }
 
     #[test]
@@ -875,10 +881,10 @@ mod tests {
     }
 
     #[test]
-    fn help_suggests_on_a_near_miss_topic() {
+    fn help_for_an_unknown_topic_points_at_help() {
         assert_eq!(
             resolve("help rebooot").into_reply().unwrap(),
-            "no help for 'rebooot' - did you mean: reboot?"
+            "no help for 'rebooot' - try 'help'"
         );
     }
 

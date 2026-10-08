@@ -82,6 +82,8 @@ bot:
 
 # `help` and `help <verb>` are built in and are not configurable: the reply is
 # rendered from this table, so a verb cannot be added without documenting it.
+# The bare `help` lists only the verbs scoped to the channel it is asked on;
+# `help <verb>` describes any verb, wherever it is asked.
 verbs:
   - name: alarm
     desc: "alarm state"

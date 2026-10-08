@@ -12,7 +12,7 @@ way mc-webui does.
 
 **Status: the bot now answers and acts.** Connection, channel verification, the
 grammar (`src/meshbot.pest`), the flat context with reserved-key poisoning
-(`src/parse.rs`), the verb table with built-in `help` and typo suggestions
+(`src/parse.rs`), the verb table with the built-in, channel-scoped `help`
 (`src/verbs.rs`), the script allowlist and executor (`src/script.rs`), the
 confirmation latch (`src/latch.rs`) and the on-air reply path (`decide` /
 `handle_message` / `send` in `src/main.rs`) are implemented and unit-tested.
@@ -33,7 +33,7 @@ because it is described below — check `src/`.
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 139 unit tests, no radio needed
+cargo test          # 192 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
@@ -620,10 +620,15 @@ Recorded so implementation doesn't relitigate them.
   `REBOOT  alpha` share one armed state — but the confirm prompt must echo the
   **text that was typed**, never the canonical word. Prompting `reboot alpha
   ok` in answer to `reboot delta` would reboot a different machine.
-- **Typos get a pointer, not a rejection**: unknown input always answers with a
-  nearest-match suggestion, using OSA distance (Levenshtein plus adjacent
-  transposition) because swapping two characters is the commonest phone-keyboard
-  slip and plain Levenshtein scores `opne` → `open` as 2, outside tolerance.
+- **No typo suggestions anywhere.** A first word that matches no verb gets
+  silence, not `did you mean: …`. The parser is verb-shaped rather than
+  sentence-shaped, so every sentence of ordinary chat is a verb guess, and a
+  bot that corrects every greeting talks over the channel. The two cases that
+  already had a fallback keep it: a bad word (`garage opne` → `try 'help garage'`)
+  and a bad topic (`help rebooot` → `try 'help'`). The OSA/`edit_distance`
+  machinery went away with the suggestions. The dropped word is logged at
+  debug by `decide`, so an operator can still see it without it being on the
+  air.
 - **Reply size is bytes**: MeshCore caps a channel payload at 160 bytes and
   `send_channel_msg` appends without any length check, so an over-long reply
   **hangs on the radio** rather than truncating. Clamp at 150 bytes on a
@@ -686,7 +691,11 @@ Recorded so implementation doesn't relitigate them.
 - **Channel scope is enforced in `decide()`**, before resolution, so it covers
   every outcome and not just the ones that spawn. A verb declared for one channel
   answers `not on this channel` on the other. `help` is not in the table and so
-  has no scope — otherwise there is no way to ask what is possible.
+  has no scope — otherwise there is no way to ask what is possible — but its bare
+  verb list is filtered with the same predicate (`VerbSpec::available_on`), so it
+  advertises only what is possible *here*. A named topic (`help reboot`) is
+  described on any channel: help is how you learn what a command does before you
+  are on the channel that runs it.
 - **`decide()` is pure and takes no `MeshCore`.** All policy — parse, scope,
   resolution, latch — lives there, and `handle_message` is only the I/O around
   it. That is what makes the latch and the scope check testable on a machine
