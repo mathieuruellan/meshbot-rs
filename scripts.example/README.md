@@ -167,7 +167,7 @@ the script's:
   `Sys.PowerMgmt`, which the guest token does not have. `PVE_TOKEN_HOST` is a
   second token from the PVE UI, named only by the entry that reboots the node.
 - A **word you did not declare does nothing** — it answers
-  `reboot: 'myServer'? did you mean: …?` and fires no script. The message
+  `reboot: 'myServer'? try 'help reboot'` and fires no script. The message
   chooses which declared entry runs; it can never supply an id.
 - One switch arms everything. `PVE_ALLOW_REBOOT=1` covers the guests and the
   hypervisor alike, so treat arming it as the decision it is.
