@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.8.0...v0.8.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* limit help to the channel's verbs and drop typo suggestions ([dd8ec23](https://github.com/mathieuruellan/meshbot-rs/commit/dd8ec23b7b06a2e3a87fdd1ab5964711c286675b))
+* limit help to the channel's verbs and drop typo suggestions ([4224895](https://github.com/mathieuruellan/meshbot-rs/commit/42248951795dd69beee89dd46a84b458cd367a1c))
+
 ## [0.8.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.7.1...v0.8.0) (2026-10-05)
 
 
