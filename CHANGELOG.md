@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.8.1...v0.9.0) (2026-10-12)
+
+
+### Features
+
+* make the confirmation window configurable with bot.confirm_ttl_secs ([28f8238](https://github.com/mathieuruellan/meshbot-rs/commit/28f8238247f3e2d0e9730c58f7042ae9702b87b4))
+* make the confirmation window configurable with bot.confirm_ttl_secs ([bf0030e](https://github.com/mathieuruellan/meshbot-rs/commit/bf0030eb14640f1a07e44b480e84b0320c7e59c8))
+
 ## [0.8.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.8.0...v0.8.1) (2026-10-08)
 
 
