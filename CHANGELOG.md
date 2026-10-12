@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.9.0...v0.10.0) (2026-10-12)
+
+
+### Features
+
+* allow channels to accept only bare help ([#31](https://github.com/mathieuruellan/meshbot-rs/issues/31)) ([5e9e13d](https://github.com/mathieuruellan/meshbot-rs/commit/5e9e13d16425950ba625da63133d3dfb57bd75b0))
+
 ## [0.9.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.8.1...v0.9.0) (2026-10-12)
 
 
