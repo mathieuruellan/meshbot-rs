@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         channels = loaded.channels.len(),
         verbs = loaded.table.names().join(" "),
         script_dir = %loaded.script_dir.display(),
+        confirm_ttl_secs = loaded.confirm_ttl_secs,
         "config loaded"
     );
 
@@ -190,7 +191,7 @@ async fn run_connection(
     tracing::info!("listening for channel messages");
 
     let script_dir = &loaded.script_dir;
-    let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+    let mut latch = latch::Latch::new(loaded.confirm_ttl_secs);
     // The radio pushes the RF log (`LOG_DATA`) for every packet it receives,
     // immediately before the fetched message that carries the text. The header
     // of that log is the only place the hop path appears: `ChannelMessage`
@@ -614,7 +615,7 @@ fn decide<'a>(
         return Decision::Reply(format!("{verb}: not on this channel"));
     }
 
-    match table.resolve(&ctx) {
+    match table.resolve(&ctx, latch.ttl_secs()) {
         verbs::Resolution::Fire { verb, action, word } => {
             if action.confirm {
                 if !ctx.confirmed() {
@@ -626,6 +627,7 @@ fn decide<'a>(
                         channel_idx,
                         verb = %verb.name,
                         key = %ctx.canonical(),
+                        ttl_secs = latch.ttl_secs(),
                         "armed, waiting for confirmation"
                     );
                     // The prompt echoes what was typed, not the canonical
@@ -635,7 +637,16 @@ fn decide<'a>(
                     // `command`, not `text`: the raw message still carries the
                     // sender tag and the marker, and echoing those would ask
                     // the user to confirm a string that can never parse.
-                    return Decision::Reply(format!("confirm: '{}'", verbs::confirm_text(command)));
+                    //
+                    // The window is quoted because it is the whole reason a
+                    // confirmation goes stale, and asking someone to type a
+                    // second message without saying how long they have is a
+                    // question with no answer.
+                    return Decision::Reply(format!(
+                        "confirm: '{}' ({}s)",
+                        verbs::confirm_text(command),
+                        latch.ttl_secs()
+                    ));
                 }
                 if !latch.take(&ctx.canonical()) {
                     // Expired, never armed, or a different key. Answer, and do
@@ -958,6 +969,14 @@ mod tests {
         &config().table
     }
 
+    /// A latch built with the window the example config declares, so a test
+    /// that arms one sees the same prompt and the same expiry a deployment does.
+    /// The expiry test builds its own with a zero window instead, because it
+    /// wants the entry dead on arrival.
+    fn new_latch() -> latch::Latch {
+        latch::Latch::new(config().confirm_ttl_secs)
+    }
+
     /// Run one command *body* through the whole policy and return what it
     /// decided. The marker is prepended here, so each test reads as the command
     /// rather than as the wire framing around it; the framing — the marker and
@@ -1005,7 +1024,7 @@ mod tests {
     #[test]
     fn a_nickname_tagged_message_is_a_command() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let d = run_raw(table, &mut latch, "NICKNAME: !komodo", ADMIN);
         assert!(d.is_execute(), "the tag and marker were not stripped");
     }
@@ -1013,14 +1032,26 @@ mod tests {
     #[test]
     fn reboot_needs_two_messages() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
 
         let first = run_on(table, &mut latch, "reboot alpha", ADMIN);
         assert!(!first.is_execute(), "one message must not reboot");
-        assert_eq!(first.reply(), Some("confirm: 'reboot alpha ok'"));
+        // The window travels with the prompt: a user who is told to type a
+        // second message should also be told how long they have to type it.
+        assert_eq!(first.reply(), Some("confirm: 'reboot alpha ok' (60s)"));
 
         let second = run_on(table, &mut latch, "reboot alpha ok", ADMIN);
         assert!(second.is_execute(), "the confirmation must run");
+    }
+
+    /// The prompt quotes the window the latch was built with, so a deployment
+    /// that configures another one documents itself on the air.
+    #[test]
+    fn the_confirm_prompt_quotes_the_configured_window() {
+        let table = table();
+        let mut latch = latch::Latch::new(600);
+        let first = run_on(table, &mut latch, "reboot alpha", ADMIN);
+        assert_eq!(first.reply(), Some("confirm: 'reboot alpha ok' (600s)"));
     }
 
     /// The whole point of keying on the canonical command: a phone keyboard that
@@ -1028,7 +1059,7 @@ mod tests {
     #[test]
     fn a_differently_spelled_confirmation_still_works() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
 
         run_on(table, &mut latch, "reboot alpha", ADMIN);
         let second = run_on(table, &mut latch, "REBOOT  AlPhA  ok", ADMIN);
@@ -1040,7 +1071,7 @@ mod tests {
     #[test]
     fn confirming_a_different_machine_does_not_run() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
 
         run_on(table, &mut latch, "reboot alpha", ADMIN);
         let wrong = run_on(table, &mut latch, "reboot beta ok", ADMIN);
@@ -1058,7 +1089,7 @@ mod tests {
     #[test]
     fn a_confirmation_with_nothing_armed_does_not_run() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let d = run_on(table, &mut latch, "reboot alpha ok", ADMIN);
         assert!(!d.is_execute());
         assert!(d.reply().is_some());
@@ -1078,7 +1109,7 @@ mod tests {
     #[test]
     fn a_confirmation_runs_only_once() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         run_on(table, &mut latch, "reboot alpha", ADMIN);
         assert!(run_on(table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
         assert!(!run_on(table, &mut latch, "reboot alpha ok", ADMIN).is_execute());
@@ -1089,7 +1120,7 @@ mod tests {
     #[test]
     fn a_stray_ok_on_a_ungated_verb_does_nothing() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let d = run_on(table, &mut latch, "garage open ok", HA);
         assert!(!d.is_execute());
         assert_eq!(d.reply(), Some("'ok' only follows a two-step command"));
@@ -1098,7 +1129,7 @@ mod tests {
     #[test]
     fn an_ungated_mutating_action_runs_in_one_message() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         assert!(run_on(table, &mut latch, "garage open", HA).is_execute());
         assert!(run_on(table, &mut latch, "alarm arm", HA).is_execute());
     }
@@ -1110,7 +1141,7 @@ mod tests {
     #[test]
     fn a_verb_cannot_run_on_the_wrong_channel() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
 
         let bare = run_on(table, &mut latch, "reboot alpha", HA);
         assert!(!bare.is_execute());
@@ -1129,7 +1160,7 @@ mod tests {
     #[test]
     fn ha_verbs_are_refused_on_the_admin_channel() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         for input in ["garage", "garage open", "alarm arm"] {
             let d = run_on(table, &mut latch, input, ADMIN);
             assert!(!d.is_execute(), "{input} ran on {ADMIN}");
@@ -1142,7 +1173,7 @@ mod tests {
     #[test]
     fn help_works_on_either_channel() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         for channel in [ADMIN, HA] {
             let d = run_on(table, &mut latch, "help", channel);
             assert!(d.reply().is_some(), "no help on {channel}");
@@ -1155,7 +1186,7 @@ mod tests {
     #[test]
     fn help_lists_only_this_channels_verbs() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
 
         let ha = run_on(table, &mut latch, "help", HA)
             .reply()
@@ -1184,7 +1215,7 @@ mod tests {
     #[test]
     fn help_describes_a_verb_of_another_channel() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let d = run_on(table, &mut latch, "help reboot", HA);
         let reply = d.reply().expect("help answers anywhere");
         assert!(reply.starts_with("reboot:"), "{reply}");
@@ -1197,7 +1228,7 @@ mod tests {
     #[test]
     fn a_channel_spoof_is_dropped_silently() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         for input in [
             "reboot alpha channel=#homeassistant",
             "reboot alpha channel_idx=9",
@@ -1215,7 +1246,7 @@ mod tests {
     #[test]
     fn a_target_spoof_does_not_change_what_runs() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let d = run_on(table, &mut latch, "reboot target=beta", ADMIN);
         assert!(!d.is_execute());
     }
@@ -1229,7 +1260,7 @@ mod tests {
     #[test]
     fn input_the_parser_rejects_gets_no_reply() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let too_long = "a".repeat(65);
         for input in [
             "",
@@ -1252,7 +1283,7 @@ mod tests {
     #[test]
     fn no_unknown_word_gets_an_answer() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         for input in ["gerage", "hello", "bonjour", "meteo"] {
             let d = run_on(table, &mut latch, input, HA);
             assert!(!d.is_execute(), "{input} ran");
@@ -1692,7 +1723,7 @@ mod tests {
     #[test]
     fn a_command_context_carries_the_senders_nickname() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let Decision::Execute { ctx, .. } =
             run_raw(table, &mut latch, "✊FR44TRIG-c14 fixe: !ping", ADMIN)
         else {
@@ -1709,7 +1740,7 @@ mod tests {
     #[test]
     fn a_bare_command_gets_the_sender_placeholder() {
         let table = table();
-        let mut latch = latch::Latch::new(latch::CONFIRM_TTL_SECS);
+        let mut latch = new_latch();
         let Decision::Execute { ctx, .. } = run_raw(table, &mut latch, "!ping", ADMIN) else {
             panic!("expected Execute");
         };

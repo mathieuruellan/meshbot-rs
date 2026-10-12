@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::Deserialize;
 
+use crate::latch;
 use crate::parse::Reserved;
 use crate::script;
 use crate::verbs::{ActionSpec, VerbSpec, VerbTable};
@@ -58,6 +59,10 @@ struct Bot {
     /// Where action scripts live. `MESHBOT_SCRIPT_DIR` overrides this, so the
     /// examples in this repo run without a deploy.
     script_dir: PathBuf,
+    /// How long a gated command stays armed waiting for its `… ok`, in seconds.
+    /// Omitted means [`crate::latch::CONFIRM_TTL_SECS`].
+    #[serde(default)]
+    confirm_ttl_secs: Option<u64>,
 }
 
 /// A validated config, ready to hand to the rest of the bot.
@@ -73,6 +78,9 @@ pub struct Loaded {
     /// against. Handed back rather than re-resolved by the caller, so a script
     /// cannot be validated in one directory and then executed in another.
     pub script_dir: PathBuf,
+    /// The confirmation window the latch is built with, in seconds. Resolved
+    /// from `bot.confirm_ttl_secs`, or the default when the key is absent.
+    pub confirm_ttl_secs: u64,
 }
 
 /// Read, parse, validate, and prepare the config. The script directory is
@@ -110,13 +118,35 @@ fn build(cfg: Config, dir: PathBuf) -> Result<Loaded> {
 
     let channels = validate_channels(&cfg.bot.channels)?;
     let reserved = validate_verbs(&cfg.verbs, &channels, &dir)?;
+    let confirm_ttl_secs = validate_confirm_ttl(cfg.bot.confirm_ttl_secs)?;
 
     Ok(Loaded {
         channels,
         table: VerbTable::new(cfg.verbs),
         reserved,
         script_dir: dir,
+        confirm_ttl_secs,
     })
+}
+
+/// Resolve the confirmation window, refusing the one value that is not a window.
+///
+/// Zero would arm nothing that a later message could ever spend, so every gated
+/// action would become unrunnable while still *looking* gated — `reboot` would
+/// answer `confirm: …` forever and never reboot. That is a silent loss of the
+/// only destructive gate, so it is a startup error naming the key rather than a
+/// value an operator can pick by omitting a digit.
+fn validate_confirm_ttl(ttl: Option<u64>) -> Result<u64> {
+    match ttl {
+        None => Ok(latch::CONFIRM_TTL_SECS),
+        Some(0) => bail!(
+            "bot.confirm_ttl_secs is 0; a confirmation window of zero seconds can never be \
+             met, so every gated action would be permanently unrunnable. Omit the key for the \
+             {}s default",
+            latch::CONFIRM_TTL_SECS
+        ),
+        Some(ttl) => Ok(ttl),
+    }
 }
 
 fn effective_script_dir(bot: &Bot) -> PathBuf {
@@ -621,6 +651,40 @@ mod tests {
         assert_eq!(loaded.script_dir, scripts());
     }
 
+    /// The window is config, and the key is optional: a host config written
+    /// before the key existed must still start, on the built-in default.
+    #[test]
+    fn an_absent_confirm_ttl_uses_the_default() {
+        let loaded = config("  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n").unwrap();
+        assert_eq!(loaded.confirm_ttl_secs, latch::CONFIRM_TTL_SECS);
+    }
+
+    /// A configured window is carried through verbatim; it is the number the
+    /// latch is built with and the number the prompt quotes.
+    #[test]
+    fn a_configured_confirm_ttl_is_used() {
+        let loaded = from_yaml(
+            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  confirm_ttl_secs: 600\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap();
+        assert_eq!(loaded.confirm_ttl_secs, 600);
+    }
+
+    /// Zero would arm a confirmation nothing could ever complete, so the one
+    /// destructive gate would look armed and never fire.
+    #[test]
+    fn a_zero_confirm_ttl_is_fatal() {
+        let err = from_yaml(
+            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  confirm_ttl_secs: 0\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("confirm_ttl_secs"), "{err}");
+        assert!(err.contains("permanently unrunnable"), "{err}");
+    }
+
     /// The shipped example is the schema's documentation, so it is validated by
     /// the build rather than trusted. `config.example.yaml` names a host path
     /// for `script_dir`, so the tracked example scripts are passed instead.
@@ -629,5 +693,8 @@ mod tests {
         let loaded = example();
         assert!(!loaded.channels.is_empty());
         assert!(loaded.table.get("reboot").is_some());
+        // The example declares the window outright rather than relying on the
+        // default, so a change to either side shows up here.
+        assert_eq!(loaded.confirm_ttl_secs, 60);
     }
 }

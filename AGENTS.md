@@ -33,7 +33,7 @@ because it is described below — check `src/`.
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 192 unit tests, no radio needed
+cargo test          # 198 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
@@ -614,12 +614,18 @@ Recorded so implementation doesn't relitigate them.
   One `PVE_ALLOW_REBOOT` arms all of them, guests and hypervisor alike. meshbot
   still never learns what `alpha` *is* — only which id and kind the operator
   filed under that word.
-- **Confirmation latch**: 30 seconds, single use, only for `reboot`. `garage`
+- **Confirmation latch**: single use, only for `reboot`, windowed by
+  `bot.confirm_ttl_secs` (default 30s; `0` is refused at load). `garage`
   and `alarm` are idempotent on a private channel, so a second message buys
   nothing. The latch keys on the **canonical** command, so `reboot alpha` and
   `REBOOT  alpha` share one armed state — but the confirm prompt must echo the
   **text that was typed**, never the canonical word. Prompting `reboot alpha
-  ok` in answer to `reboot delta` would reboot a different machine.
+  ok` in answer to `reboot delta` would reboot a different machine. Both the
+  prompt (`confirm: '… ok' (Ns)`) and `help <verb>` (`… within Ns`) quote the
+  configured window: it is the reason a confirmation goes stale, so a user who
+  is asked to type a second message is told how long they have to type it. The
+  value is read off the `Latch` rather than out of the config again, so the
+  prompt, the help line and the expiry cannot disagree.
 - **No typo suggestions anywhere.** A first word that matches no verb gets
   silence, not `did you mean: …`. The parser is verb-shaped rather than
   sentence-shaped, so every sentence of ordinary chat is a verb guess, and a

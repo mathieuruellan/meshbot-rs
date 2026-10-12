@@ -17,7 +17,7 @@ schema: 1
 #
 #   garage              -> status query
 #   garage open         -> act, using the declared word `open`
-#   reboot alpha       -> act, then arm a 30s latch
+#   reboot alpha       -> act, then arm a confirmation latch
 #   reboot alpha ok    -> the confirmation for exactly that command
 #
 # The verb is the only positional argument, and a bare word must be one a verb
@@ -66,12 +66,27 @@ bot:
     3: "#admin"
     4: "#homeassistant"
 
-  # Reply length, the confirmation-latch window, and the default action timeout
-  # are code constants, not config: MAX_REPLY_BYTES, latch::CONFIRM_TTL_SECS,
-  # and script::DEFAULT_TIMEOUT_SECS. They are properties of the radio and the
-  # protocol rather than of a deployment — and an over-long reply hangs on the
-  # radio rather than truncating, so that one is not an operator's choice to
-  # make.
+  # How long a gated command stays armed waiting for its `… ok`, in seconds.
+  # `reboot alpha` arms a proposal; this is the window in which `reboot alpha
+  # ok` completes it. The prompt and `help <verb>` both quote the value, so a
+  # user is told how long they have rather than having to know.
+  #
+  # Omitted means the built-in 30s. Zero is refused: a window that can never be
+  # met would leave every gated action permanently unrunnable while still
+  # appearing to ask for confirmation.
+  #
+  # Keep it short. The window is the safety margin, not just a convenience: an
+  # armed command is a live proposal, and a forgotten one should not authorise
+  # a reboot minutes later. Re-issuing the command refreshes it, so a slow
+  # typist can always arm again.
+  confirm_ttl_secs: 60
+
+  # Reply length and the default action timeout are code constants, not config:
+  # MAX_REPLY_BYTES and script::DEFAULT_TIMEOUT_SECS. They are properties of the
+  # radio and the protocol rather than of a deployment — and an over-long reply
+  # hangs on the radio rather than truncating, so that one is not an operator's
+  # choice to make. (The latch window used to be listed here too; it is now
+  # `confirm_ttl_secs`, above.)
 
   # Actions name a script inside this directory. A name that resolves outside it
   # is rejected at load, and the script is executed directly — never through a
