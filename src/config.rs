@@ -63,6 +63,11 @@ struct Bot {
     /// Omitted means [`crate::latch::CONFIRM_TTL_SECS`].
     #[serde(default)]
     confirm_ttl_secs: Option<u64>,
+    /// Channel indices where only the bare `help` command answers: a named
+    /// topic (`help reboot`) is silent and no reply mentions help. Omitted
+    /// means every channel gets the full help surface.
+    #[serde(default)]
+    help_list_only: Vec<u8>,
 }
 
 /// A validated config, ready to hand to the rest of the bot.
@@ -81,6 +86,23 @@ pub struct Loaded {
     /// The confirmation window the latch is built with, in seconds. Resolved
     /// from `bot.confirm_ttl_secs`, or the default when the key is absent.
     pub confirm_ttl_secs: u64,
+    /// Channels where only the bare `help` answers, resolved from
+    /// `bot.help_list_only` and checked against the listen set.
+    pub help_list_only: BTreeSet<u8>,
+}
+
+impl Loaded {
+    /// The help mode of the channel a message arrived on.
+    ///
+    /// The one place the index set becomes a policy, so `decide` and the tests
+    /// cannot disagree about which channels are list-only.
+    pub fn help_mode(&self, channel_idx: u8) -> crate::verbs::HelpMode {
+        if self.help_list_only.contains(&channel_idx) {
+            crate::verbs::HelpMode::ListOnly
+        } else {
+            crate::verbs::HelpMode::Full
+        }
+    }
 }
 
 /// Read, parse, validate, and prepare the config. The script directory is
@@ -119,6 +141,7 @@ fn build(cfg: Config, dir: PathBuf) -> Result<Loaded> {
     let channels = validate_channels(&cfg.bot.channels)?;
     let reserved = validate_verbs(&cfg.verbs, &channels, &dir)?;
     let confirm_ttl_secs = validate_confirm_ttl(cfg.bot.confirm_ttl_secs)?;
+    let help_list_only = validate_help_list_only(&cfg.bot.help_list_only, &channels)?;
 
     Ok(Loaded {
         channels,
@@ -126,6 +149,7 @@ fn build(cfg: Config, dir: PathBuf) -> Result<Loaded> {
         reserved,
         script_dir: dir,
         confirm_ttl_secs,
+        help_list_only,
     })
 }
 
@@ -147,6 +171,31 @@ fn validate_confirm_ttl(ttl: Option<u64>) -> Result<u64> {
         ),
         Some(ttl) => Ok(ttl),
     }
+}
+
+/// The channels that get only the bare `help`, checked against the listen set.
+///
+/// An index the bot does not listen on can never receive a message, so listing
+/// one is either a typo for an index that does exist or a leftover from a
+/// channel that was removed — both worth a startup error rather than a setting
+/// that silently does nothing.
+fn validate_help_list_only(list: &[u8], channels: &[(u8, String)]) -> Result<BTreeSet<u8>> {
+    let listened: BTreeSet<u8> = channels.iter().map(|(i, _)| *i).collect();
+    let mut resolved = BTreeSet::new();
+    for idx in list {
+        ensure!(
+            listened.contains(idx),
+            "bot.help_list_only has index {idx}, which is not in bot.channels; \
+             listening on {}",
+            listened
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        resolved.insert(*idx);
+    }
+    Ok(resolved)
 }
 
 fn effective_script_dir(bot: &Bot) -> PathBuf {
@@ -408,6 +457,7 @@ fn check_template(at: &str, template: &str, allowed: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verbs::HelpMode;
 
     /// A scratch script directory with one script in it, so `resolve_script`
     /// has something real to find.
@@ -683,6 +733,45 @@ mod tests {
         .to_string();
         assert!(err.contains("confirm_ttl_secs"), "{err}");
         assert!(err.contains("permanently unrunnable"), "{err}");
+    }
+
+    /// The key is optional, and a config written before it existed must still
+    /// start with every channel on the full help surface.
+    #[test]
+    fn an_absent_help_list_only_means_full_help_everywhere() {
+        let loaded = config("  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n").unwrap();
+        assert!(loaded.help_list_only.is_empty());
+        assert_eq!(loaded.help_mode(2), HelpMode::Full);
+        assert_eq!(loaded.help_mode(3), HelpMode::Full);
+    }
+
+    /// A listed channel resolves to the list-only mode; one that is not listed
+    /// keeps full help.
+    #[test]
+    fn a_listed_channel_is_list_only_and_the_others_are_not() {
+        let loaded = from_yaml(
+            "schema: 1\nbot:\n  channels: {2: admin, 3: home}\n  script_dir: /unused\n  help_list_only: [3]\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap();
+        assert_eq!(loaded.help_list_only, BTreeSet::from([3]));
+        assert_eq!(loaded.help_mode(3), HelpMode::ListOnly);
+        assert_eq!(loaded.help_mode(2), HelpMode::Full);
+    }
+
+    /// An index the bot does not listen on can never receive a message, so
+    /// listing one is a typo or a leftover — a startup error, not a setting
+    /// that silently does nothing.
+    #[test]
+    fn help_list_only_must_name_a_listened_channel() {
+        let err = from_yaml(
+            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  help_list_only: [3]\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("help_list_only"), "{err}");
+        assert!(err.contains('3'), "{err}");
     }
 
     /// The shipped example is the schema's documentation, so it is validated by

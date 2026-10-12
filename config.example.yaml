@@ -65,6 +65,23 @@ bot:
   channels:
     3: "#admin"
     4: "#homeassistant"
+    # A public hashtag: anyone on the mesh can post here, so it is also where
+    # a full help would be noise and an oracle at once. No verb is scoped to
+    # it in this example — the channel map may list one none of them uses.
+    5: "#public"
+
+  # Channels where only the bare `help` answers: a named topic (`help reboot`)
+  # is dropped, the bare list does not advertise `help <verb>`, and no reply
+  # mentions help — a bad word still answers (`garage: 'opne'?`), it just
+  # never redirects. Indices, like the channels map, and each one must be a
+  # channel `bot.channels` listens on.
+  #
+  # Put a public or heavily-shared channel here. `help <verb>` on such a
+  # channel documents commands scoped to private ones — `help reboot` would
+  # spell out the only destructive action for anyone who thought to ask —
+  # and every `try 'help …'` hint advertises a surface that is then refused.
+  # Omitted means every channel gets the full help surface.
+  help_list_only: [5]
 
   # How long a gated command stays armed waiting for its `… ok`, in seconds.
   # `reboot alpha` arms a proposal; this is the window in which `reboot alpha
@@ -95,10 +112,12 @@ bot:
   # scripts.example/ are run locally.
   script_dir: /data/meshcore/meshbot-rs/scripts
 
-# `help` and `help <verb>` are built in and are not configurable: the reply is
-# rendered from this table, so a verb cannot be added without documenting it.
+# `help` and `help <verb>` are built in: the reply is rendered from this table,
+# so a verb cannot be added without documenting it. How much of that surface a
+# channel exposes is `bot.help_list_only`, above.
 # The bare `help` lists only the verbs scoped to the channel it is asked on;
-# `help <verb>` describes any verb, wherever it is asked.
+# `help <verb>` describes any verb, wherever it is asked, except on a
+# list-only channel where it is dropped.
 verbs:
   - name: alarm
     desc: "alarm state"
