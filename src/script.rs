@@ -610,9 +610,14 @@ mod tests {
     /// message can pick a machine, never invent one.
     #[test]
     fn an_undeclared_word_fires_nothing() {
-        let table = &crate::config::example().table;
+        let loaded = crate::config::example();
         let ctx = parse::parse("reboot myPersonalServer").unwrap();
-        assert!(!table.resolve(&ctx).is_actionable());
+        assert!(
+            !loaded
+                .table
+                .resolve(&ctx, loaded.confirm_ttl_secs)
+                .is_actionable()
+        );
     }
 
     #[test]

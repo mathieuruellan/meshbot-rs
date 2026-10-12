@@ -23,9 +23,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Default arming window. Long enough to type a second message on a phone
-/// keyboard, short enough that a forgotten prompt does not authorise a reboot
-/// much later.
+/// Default arming window, used when `bot.confirm_ttl_secs` is absent. Long
+/// enough to type a second message on a phone keyboard, short enough that a
+/// forgotten prompt does not authorise a reboot much later. The window itself
+/// is config: see `bot.confirm_ttl_secs`.
 pub const CONFIRM_TTL_SECS: u64 = 30;
 
 /// Armed commands, keyed by [`crate::parse::Context::canonical`].
@@ -41,6 +42,17 @@ impl Latch {
             armed: HashMap::new(),
             ttl: Duration::from_secs(ttl_secs),
         }
+    }
+
+    /// The window entries are armed with, in seconds.
+    ///
+    /// The reply that asks for a confirmation quotes it, so a user is told how
+    /// long the proposal stays live rather than having to know. It is the
+    /// *configured* window — the same number the armed entry expires against —
+    /// read back off the latch rather than out of the config again, so the
+    /// prompt and the expiry cannot disagree.
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl.as_secs()
     }
 
     /// Arm `key`, replacing any previous arming. Re-issuing `reboot alpha`
@@ -104,6 +116,14 @@ mod tests {
     fn taking_with_nothing_armed_does_nothing() {
         let mut latch = Latch::new(CONFIRM_TTL_SECS);
         assert!(!latch.take("reboot alpha"));
+    }
+
+    /// The confirmation prompt quotes this, so it must be the window entries
+    /// actually expire against, not a separately-stored number.
+    #[test]
+    fn ttl_secs_reports_the_window_it_was_built_with() {
+        assert_eq!(Latch::new(CONFIRM_TTL_SECS).ttl_secs(), CONFIRM_TTL_SECS);
+        assert_eq!(Latch::new(600).ttl_secs(), 600);
     }
 
     /// A different machine must not be reachable from an existing arming, and

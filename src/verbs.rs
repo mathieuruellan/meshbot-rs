@@ -173,7 +173,11 @@ impl VerbTable {
     }
 
     /// Decide what a parsed message means.
-    pub fn resolve<'a>(&'a self, ctx: &Context) -> Resolution<'a> {
+    ///
+    /// `confirm_ttl_secs` is the configured confirmation window, needed only to
+    /// render `help`: the two-step line quotes how long a confirmation stays
+    /// live, so a user is told rather than left to guess.
+    pub fn resolve<'a>(&'a self, ctx: &Context, confirm_ttl_secs: u64) -> Resolution<'a> {
         let Some(verb_name) = ctx.verb() else {
             return Resolution::NoVerb;
         };
@@ -188,8 +192,8 @@ impl VerbTable {
                 _ => None,
             };
             return match ctx.target() {
-                Some(topic) => self.help(Some(topic), channel),
-                None => self.help(None, channel),
+                Some(topic) => self.help(Some(topic), channel, confirm_ttl_secs),
+                None => self.help(None, channel, confirm_ttl_secs),
             };
         }
 
@@ -239,7 +243,16 @@ impl VerbTable {
     /// use. A named topic is described wherever it was asked about: help is
     /// informational, and refusing to describe `reboot` on #homeassistant would
     /// leave no way to learn what it does before moving to #admin.
-    pub fn help(&self, topic: Option<&str>, channel: Option<&str>) -> Resolution<'_> {
+    ///
+    /// `confirm_ttl_secs` is quoted on the two-step line, so `help reboot`
+    /// answers the question the prompt raises: how long do I have to type the
+    /// second message.
+    pub fn help(
+        &self,
+        topic: Option<&str>,
+        channel: Option<&str>,
+        confirm_ttl_secs: u64,
+    ) -> Resolution<'_> {
         let Some(topic) = topic else {
             let names = self.names_on(channel);
             if names.is_empty() {
@@ -265,7 +278,9 @@ impl VerbTable {
             line.push_str(&words.join(" "));
         }
         if let (true, Some(word)) = (verb.needs_confirm(), verb.primary_word()) {
-            line.push_str(&format!(" | 2-step: '{verb} {word}{CONFIRM_SUFFIX}'"));
+            line.push_str(&format!(
+                " | 2-step: '{verb} {word}{CONFIRM_SUFFIX}' within {confirm_ttl_secs}s"
+            ));
         }
         Resolution::Help(clamp(&line, MAX_REPLY_BYTES))
     }
@@ -610,9 +625,13 @@ mod tests {
         TABLE.get_or_init(table)
     }
 
+    /// The window these tests resolve with. Not the config's: `resolve` is
+    /// handed it, and the value only reaches the reply through `help`.
+    const CONFIRM_TTL: u64 = crate::latch::CONFIRM_TTL_SECS;
+
     fn resolve(input: &str) -> Resolution<'static> {
         let ctx = parse::parse(input).unwrap();
-        static_table().resolve(&ctx)
+        static_table().resolve(&ctx, CONFIRM_TTL)
     }
 
     /// As [`resolve`], but as the message would arrive: with the channel the
@@ -620,7 +639,7 @@ mod tests {
     fn resolve_on(input: &str, channel: &str) -> Resolution<'static> {
         let mut ctx = parse::parse(input).unwrap();
         with_system(&mut ctx, channel, 3, &parse::MessageMeta::default());
-        static_table().resolve(&ctx)
+        static_table().resolve(&ctx, CONFIRM_TTL)
     }
 
     #[test]
@@ -867,9 +886,20 @@ mod tests {
         assert_eq!(
             reply,
             "reboot: reboot a host | alpha beta gamma delta komodo pve | \
-             2-step: 'reboot alpha ok'"
+             2-step: 'reboot alpha ok' within 30s"
         );
         assert!(reply.len() <= MAX_REPLY_BYTES);
+    }
+
+    /// The window is the one the caller is resolving with, so a deployment that
+    /// configures a different one documents itself on the air rather than
+    /// advertising a 30s window it does not have.
+    #[test]
+    fn the_confirm_window_in_help_is_the_one_asked_for() {
+        let ctx = parse::parse("help reboot").unwrap();
+        let reply = static_table().resolve(&ctx, 600).into_reply().unwrap();
+        assert!(reply.contains("within 600s"), "{reply}");
+        assert!(!reply.contains("within 30s"), "{reply}");
     }
 
     #[test]
@@ -1216,12 +1246,13 @@ mod tests {
 
     #[test]
     fn the_default_verb_set_resolves_and_fits_the_budget() {
-        let table = &crate::config::example().table;
+        let loaded = crate::config::example();
+        let table = &loaded.table;
         for name in table.names() {
             // A bare verb is actionable only where the config declares a status
             // query; `reboot` has none, and `help` is handled before the table.
             let verb = table.get(name).unwrap();
-            let resolution = table.resolve(&parse::parse(name).unwrap());
+            let resolution = table.resolve(&parse::parse(name).unwrap(), loaded.confirm_ttl_secs);
             assert_eq!(
                 resolution.is_actionable(),
                 verb.get.is_some(),
@@ -1231,13 +1262,16 @@ mod tests {
             for word in verb.args.iter().flat_map(|a| a.words.iter()) {
                 let ctx = parse::parse(&format!("{name} {word}")).unwrap();
                 assert!(
-                    table.resolve(&ctx).is_actionable(),
+                    table.resolve(&ctx, loaded.confirm_ttl_secs).is_actionable(),
                     "{name} {word} does not resolve"
                 );
             }
 
             let ctx = parse::parse(&format!("help {name}")).unwrap();
-            let reply = table.resolve(&ctx).into_reply().unwrap();
+            let reply = table
+                .resolve(&ctx, loaded.confirm_ttl_secs)
+                .into_reply()
+                .unwrap();
             assert!(reply.len() <= MAX_REPLY_BYTES, "help {name}: {reply}");
         }
     }
