@@ -538,6 +538,14 @@ impl Decision<'_> {
 }
 
 /// Decide what one inbound message means. Pure apart from the latch's clock.
+///
+/// `help` is the channel's help mode, resolved from `bot.help_list_only` by
+/// the caller: a [`verbs::HelpMode::ListOnly`] channel takes the bare `help`
+/// and nothing else, and no reply on it may mention help.
+// Eight parameters, like `handle_message` below: each is one distinct input to
+// the decision, and grouping them into structs would only move the same fields
+// behind more names.
+#[allow(clippy::too_many_arguments)]
 fn decide<'a>(
     table: &'a verbs::VerbTable,
     reserved: &parse::Reserved,
@@ -546,6 +554,7 @@ fn decide<'a>(
     channel: &str,
     channel_idx: u8,
     meta: &parse::MessageMeta,
+    help: verbs::HelpMode,
 ) -> Decision<'a> {
     // The marker decides whether this is a command at all. Everything below
     // works on the text *after* it, never on the raw message, so the sender tag
@@ -615,7 +624,7 @@ fn decide<'a>(
         return Decision::Reply(format!("{verb}: not on this channel"));
     }
 
-    match table.resolve(&ctx, latch.ttl_secs()) {
+    match table.resolve(&ctx, latch.ttl_secs(), help) {
         verbs::Resolution::Fire { verb, action, word } => {
             if action.confirm {
                 if !ctx.confirmed() {
@@ -682,7 +691,14 @@ fn decide<'a>(
             tracing::debug!(channel_idx, verb = %input, "unknown verb");
             Decision::Ignore
         }
-        other => match other.into_reply() {
+        // Understood and deliberately refused: a help topic on a channel
+        // configured to take only the bare `help`. Debug, so a silence on air
+        // is still a line in the log rather than looking like a parse drop.
+        verbs::Resolution::Silent => {
+            tracing::debug!(channel_idx, "help topic suppressed on a list-only channel");
+            Decision::Ignore
+        }
+        other => match other.into_reply(help) {
             Some(reply) => Decision::Reply(reply),
             None => Decision::Ignore,
         },
@@ -780,6 +796,7 @@ async fn handle_message(
         channel,
         channel_idx,
         meta,
+        config.help_mode(channel_idx),
     ) {
         Decision::Ignore => {}
         Decision::Reply(reply) => send(meshcore, channel_idx, &[reply]).await,
@@ -1013,6 +1030,7 @@ mod tests {
             channel,
             idx,
             &parse::MessageMeta::default(),
+            loaded.help_mode(idx),
         )
     }
 
@@ -1219,6 +1237,49 @@ mod tests {
         let d = run_on(table, &mut latch, "help reboot", HA);
         let reply = d.reply().expect("help answers anywhere");
         assert!(reply.starts_with("reboot:"), "{reply}");
+    }
+
+    // ---- `bot.help_list_only`: the #public example channel takes only the
+    // ---- bare `help`, and nothing on it may mention help.
+
+    /// The one surface the mode keeps: the bare command answers, filtered to
+    /// this channel like anywhere else, but without advertising topics.
+    #[test]
+    fn bare_help_still_answers_on_a_list_only_channel() {
+        let table = table();
+        let mut latch = new_latch();
+        let d = run_on(table, &mut latch, "help", "#public");
+        let reply = d
+            .reply()
+            .expect("bare help on a list-only channel")
+            .to_string();
+        // #public has no verbs in the example config.
+        assert_eq!(reply, "no verbs on this channel");
+    }
+
+    /// A named topic is understood and refused: no description of a verb from
+    /// a private channel, and no `no help for '…'` for a typo either.
+    #[test]
+    fn a_help_topic_is_dropped_on_a_list_only_channel() {
+        let table = table();
+        let mut latch = new_latch();
+        for input in ["help reboot", "help alarm", "help nope"] {
+            let d = run_on(table, &mut latch, input, "#public");
+            assert_eq!(d.reply(), None, "{input} was answered on #public");
+        }
+    }
+
+    /// The same inputs on a full-help channel are unchanged, so the mode is
+    /// per-channel and not a global silencing.
+    #[test]
+    fn a_help_topic_still_answers_on_a_full_help_channel() {
+        let table = table();
+        let mut latch = new_latch();
+        assert!(
+            run_on(table, &mut latch, "help reboot", ADMIN)
+                .reply()
+                .is_some()
+        );
     }
 
     // ---- reserved-key poisoning

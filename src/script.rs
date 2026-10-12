@@ -615,7 +615,7 @@ mod tests {
         assert!(
             !loaded
                 .table
-                .resolve(&ctx, loaded.confirm_ttl_secs)
+                .resolve(&ctx, loaded.confirm_ttl_secs, crate::verbs::HelpMode::Full)
                 .is_actionable()
         );
     }

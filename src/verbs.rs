@@ -177,7 +177,16 @@ impl VerbTable {
     /// `confirm_ttl_secs` is the configured confirmation window, needed only to
     /// render `help`: the two-step line quotes how long a confirmation stays
     /// live, so a user is told rather than left to guess.
-    pub fn resolve<'a>(&'a self, ctx: &Context, confirm_ttl_secs: u64) -> Resolution<'a> {
+    ///
+    /// `help` is the channel's help mode: a [`HelpMode::ListOnly`] channel
+    /// accepts the bare command and nothing else, and drops the rest here
+    /// rather than in `decide`, so the whole policy lives in one place.
+    pub fn resolve<'a>(
+        &'a self,
+        ctx: &Context,
+        confirm_ttl_secs: u64,
+        help: HelpMode,
+    ) -> Resolution<'a> {
         let Some(verb_name) = ctx.verb() else {
             return Resolution::NoVerb;
         };
@@ -192,8 +201,9 @@ impl VerbTable {
                 _ => None,
             };
             return match ctx.target() {
-                Some(topic) => self.help(Some(topic), channel, confirm_ttl_secs),
-                None => self.help(None, channel, confirm_ttl_secs),
+                Some(_) if help == HelpMode::ListOnly => Resolution::Silent,
+                Some(topic) => self.help(Some(topic), channel, confirm_ttl_secs, help),
+                None => self.help(None, channel, confirm_ttl_secs, help),
             };
         }
 
@@ -244,6 +254,11 @@ impl VerbTable {
     /// informational, and refusing to describe `reboot` on #homeassistant would
     /// leave no way to learn what it does before moving to #admin.
     ///
+    /// A [`HelpMode::ListOnly`] channel gets the bare list with no
+    /// `try 'help <verb>'` pointer — advertising a surface that would answer
+    /// nothing is worse than not mentioning it. `resolve` turns a named topic
+    /// on such a channel into [`Resolution::Silent`] before this is reached.
+    ///
     /// `confirm_ttl_secs` is quoted on the two-step line, so `help reboot`
     /// answers the question the prompt raises: how long do I have to type the
     /// second message.
@@ -252,13 +267,17 @@ impl VerbTable {
         topic: Option<&str>,
         channel: Option<&str>,
         confirm_ttl_secs: u64,
+        help: HelpMode,
     ) -> Resolution<'_> {
         let Some(topic) = topic else {
             let names = self.names_on(channel);
             if names.is_empty() {
                 return Resolution::Help("no verbs on this channel".to_string());
             }
-            let line = format!("verbs: {} | try 'help <verb>'", names.join(" "));
+            let line = match help {
+                HelpMode::ListOnly => format!("verbs: {}", names.join(" ")),
+                HelpMode::Full => format!("verbs: {} | try 'help <verb>'", names.join(" ")),
+            };
             return Resolution::Help(clamp(&line, MAX_REPLY_BYTES));
         };
 
@@ -286,11 +305,40 @@ impl VerbTable {
     }
 }
 
+/// How much of the help surface a channel exposes.
+///
+/// A channel may be public and shared — `#bot` is a hashtag anyone can join —
+/// and there a full help is both noise and an oracle: `help reboot` would
+/// document a destructive command scoped to a private channel, and every
+/// `try 'help …'` hint would advertise a surface that is then refused. So such
+/// a channel gets [`HelpMode::ListOnly`]: the bare `help` lists what answers
+/// *here*, and nothing else mentions help at all.
+///
+/// Configured with `bot.help_list_only`; absent means [`HelpMode::Full`],
+/// which is the behaviour every channel had before the key existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HelpMode {
+    /// `help` lists this channel's verbs and points at `help <verb>`;
+    /// `help <verb>` describes any verb on any channel; error replies may
+    /// point at help. The default, and what every channel gets unless
+    /// configured otherwise.
+    #[default]
+    Full,
+    /// Only the bare `help` answers, without advertising topics; a named
+    /// topic is dropped and no reply mentions help.
+    ListOnly,
+}
+
 /// What a message turned out to mean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution<'a> {
     /// A reply the bot can send verbatim. Carries the whole `help` surface.
     Help(String),
+    /// Deliberately no reply: a named help topic on a [`HelpMode::ListOnly`]
+    /// channel. Distinct from [`Resolution::UnknownVerb`] because the input
+    /// *was* understood — it is refused, not unmatched — so `decide` logs it
+    /// as a suppression rather than as an unknown verb.
+    Silent,
     /// Run this action.
     Fire {
         verb: &'a VerbSpec,
@@ -319,13 +367,25 @@ pub enum Resolution<'a> {
 
 impl<'a> Resolution<'a> {
     /// The reply to send when nothing may be run.
-    pub fn into_reply(self) -> Option<String> {
+    ///
+    /// `help` is the channel's help mode: on a [`HelpMode::ListOnly`] channel
+    /// no reply may point at help, so the hints below are built without it
+    /// rather than built and then edited.
+    pub fn into_reply(self, help: HelpMode) -> Option<String> {
         match self {
             Self::Help(line) => Some(line),
-            Self::NoVerb => Some("no command - try 'help'".to_string()),
-            Self::NoQuery { suggestion, .. } => Some(match suggestion {
-                Some(s) => format!("try '{s}' or 'help'"),
-                None => "try 'help'".to_string(),
+            Self::Silent => None,
+            Self::NoVerb => Some(match help {
+                HelpMode::Full => "no command - try 'help'".to_string(),
+                HelpMode::ListOnly => "no command".to_string(),
+            }),
+            Self::NoQuery { suggestion, .. } => Some(match (suggestion, help) {
+                (Some(s), HelpMode::Full) => format!("try '{s}' or 'help'"),
+                (Some(s), HelpMode::ListOnly) => format!("try '{s}'"),
+                // With no word to suggest and no help to point at, there is
+                // nothing worth a transmission.
+                (None, HelpMode::Full) => "try 'help'".to_string(),
+                (None, HelpMode::ListOnly) => return None,
             }),
             // Silence, deliberately, and for every unknown word rather than
             // only the far ones. The parser is verb-shaped rather than
@@ -334,7 +394,13 @@ impl<'a> Resolution<'a> {
             // corrects every greeting talks over the channel.
             Self::UnknownVerb { .. } => None,
             Self::BadArg { verb, input } => {
-                let line = format!("{verb}: '{input}'? try 'help {verb}'");
+                // The bad word itself is always worth saying — on a
+                // ListOnly channel the reply still answers, it just never
+                // redirects to help.
+                let line = match help {
+                    HelpMode::Full => format!("{verb}: '{input}'? try 'help {verb}'"),
+                    HelpMode::ListOnly => format!("{verb}: '{input}'?"),
+                };
                 Some(clamp(&line, MAX_REPLY_BYTES))
             }
             Self::Fire { .. } => None,
@@ -630,16 +696,26 @@ mod tests {
     const CONFIRM_TTL: u64 = crate::latch::CONFIRM_TTL_SECS;
 
     fn resolve(input: &str) -> Resolution<'static> {
+        resolve_in(input, HelpMode::Full)
+    }
+
+    /// As [`resolve`], but under a chosen help mode.
+    fn resolve_in(input: &str, help: HelpMode) -> Resolution<'static> {
         let ctx = parse::parse(input).unwrap();
-        static_table().resolve(&ctx, CONFIRM_TTL)
+        static_table().resolve(&ctx, CONFIRM_TTL, help)
     }
 
     /// As [`resolve`], but as the message would arrive: with the channel the
     /// engine injects, which is what `help` filters its list against.
     fn resolve_on(input: &str, channel: &str) -> Resolution<'static> {
+        resolve_on_in(input, channel, HelpMode::Full)
+    }
+
+    /// As [`resolve_on`], but under a chosen help mode.
+    fn resolve_on_in(input: &str, channel: &str, help: HelpMode) -> Resolution<'static> {
         let mut ctx = parse::parse(input).unwrap();
         with_system(&mut ctx, channel, 3, &parse::MessageMeta::default());
-        static_table().resolve(&ctx, CONFIRM_TTL)
+        static_table().resolve(&ctx, CONFIRM_TTL, help)
     }
 
     #[test]
@@ -827,13 +903,13 @@ mod tests {
     /// first word of ordinary chat.
     #[test]
     fn an_unknown_word_gets_no_reply() {
-        assert_eq!(resolve("gerage").into_reply(), None);
+        assert_eq!(resolve("gerage").into_reply(HelpMode::Full), None);
         assert!(!resolve("gerage").is_actionable());
     }
 
     #[test]
     fn a_bad_arg_points_at_help_for_the_verb() {
-        let reply = resolve("garage opne").into_reply().unwrap();
+        let reply = resolve("garage opne").into_reply(HelpMode::Full).unwrap();
         assert_eq!(reply, "garage: 'opne'? try 'help garage'");
     }
 
@@ -841,7 +917,7 @@ mod tests {
     /// listed. What a channel sees is [`help_lists_only_the_verbs_of_the_channel`].
     #[test]
     fn help_lists_every_verb_and_fits_one_frame() {
-        let reply = resolve("help").into_reply().unwrap();
+        let reply = resolve("help").into_reply(HelpMode::Full).unwrap();
         assert_eq!(
             reply,
             "verbs: alarm garage internet reboot | try 'help <verb>'"
@@ -853,10 +929,14 @@ mod tests {
     /// here, or `help` advertises commands that answer `not on this channel`.
     #[test]
     fn help_lists_only_the_verbs_of_the_channel() {
-        let ha = resolve_on("help", "#homeassistant").into_reply().unwrap();
+        let ha = resolve_on("help", "#homeassistant")
+            .into_reply(HelpMode::Full)
+            .unwrap();
         assert_eq!(ha, "verbs: alarm garage | try 'help <verb>'");
 
-        let admin = resolve_on("help", "#admin").into_reply().unwrap();
+        let admin = resolve_on("help", "#admin")
+            .into_reply(HelpMode::Full)
+            .unwrap();
         assert_eq!(admin, "verbs: internet reboot | try 'help <verb>'");
         assert!(admin.len() <= MAX_REPLY_BYTES);
     }
@@ -865,7 +945,9 @@ mod tests {
     /// not render as `verbs:  | …`.
     #[test]
     fn help_on_a_channel_with_no_verbs_says_so() {
-        let reply = resolve_on("help", "#family").into_reply().unwrap();
+        let reply = resolve_on("help", "#family")
+            .into_reply(HelpMode::Full)
+            .unwrap();
         assert_eq!(reply, "no verbs on this channel");
     }
 
@@ -875,14 +957,14 @@ mod tests {
     #[test]
     fn help_describes_a_verb_of_another_channel() {
         let reply = resolve_on("help reboot", "#homeassistant")
-            .into_reply()
+            .into_reply(HelpMode::Full)
             .unwrap();
         assert!(reply.starts_with("reboot: reboot a host"), "{reply}");
     }
 
     #[test]
     fn help_for_a_verb_shows_words_and_the_confirm_prompt() {
-        let reply = resolve("help reboot").into_reply().unwrap();
+        let reply = resolve("help reboot").into_reply(HelpMode::Full).unwrap();
         assert_eq!(
             reply,
             "reboot: reboot a host | alpha beta gamma delta komodo pve | \
@@ -891,13 +973,86 @@ mod tests {
         assert!(reply.len() <= MAX_REPLY_BYTES);
     }
 
+    // ---- HelpMode::ListOnly: the bare command answers, nothing else does
+
+    /// The whole point of the mode: on a public channel a named topic is
+    /// both noise and an oracle — it would document a destructive command
+    /// scoped to a private channel for anyone who thought to ask.
+    #[test]
+    fn a_named_topic_is_silent_on_a_list_only_channel() {
+        let reboot = resolve_on_in("help reboot", "#admin", HelpMode::ListOnly);
+        assert_eq!(reboot, Resolution::Silent);
+        assert_eq!(reboot.into_reply(HelpMode::ListOnly), None);
+
+        // Even a topic that belongs *here* is refused: the mode is about the
+        // channel, not about the verb's scope.
+        let garage = resolve_on_in("help garage", "#homeassistant", HelpMode::ListOnly);
+        assert_eq!(garage.into_reply(HelpMode::ListOnly), None);
+
+        // And so is a typo'd topic: no `no help for '…' - try 'help'` either.
+        let typo = resolve_on_in("help rebooot", "#admin", HelpMode::ListOnly);
+        assert_eq!(typo.into_reply(HelpMode::ListOnly), None);
+    }
+
+    /// The bare command still answers — it is the one surface the mode keeps —
+    /// but it no longer advertises a topic surface that would answer nothing.
+    #[test]
+    fn bare_help_on_a_list_only_channel_lists_without_the_pointer() {
+        let reply = resolve_on_in("help", "#homeassistant", HelpMode::ListOnly)
+            .into_reply(HelpMode::ListOnly)
+            .unwrap();
+        assert_eq!(reply, "verbs: alarm garage");
+        assert!(!reply.contains("help"), "{reply}");
+    }
+
+    #[test]
+    fn bare_help_on_a_list_only_channel_with_no_verbs_still_says_so() {
+        let reply = resolve_on_in("help", "#family", HelpMode::ListOnly)
+            .into_reply(HelpMode::ListOnly)
+            .unwrap();
+        assert_eq!(reply, "no verbs on this channel");
+    }
+
+    /// A bad word is still worth saying out loud — the mode silences help,
+    /// not the answer to "why did nothing happen".
+    #[test]
+    fn a_bad_arg_still_answers_on_a_list_only_channel_without_pointing_at_help() {
+        let reply = resolve_in("garage opne", HelpMode::ListOnly)
+            .into_reply(HelpMode::ListOnly)
+            .unwrap();
+        assert_eq!(reply, "garage: 'opne'?");
+        assert!(!reply.contains("help"), "{reply}");
+    }
+
+    #[test]
+    fn no_command_hint_drops_help_on_a_list_only_channel() {
+        // NoVerb is the resolution for a context with no verb at all.
+        let reply = Resolution::NoVerb.into_reply(HelpMode::ListOnly).unwrap();
+        assert_eq!(reply, "no command");
+    }
+
+    #[test]
+    fn a_no_query_hint_keeps_the_word_and_drops_help_on_a_list_only_channel() {
+        let ctx = parse::parse("reboot").unwrap();
+        let reply = static_table()
+            .resolve(&ctx, CONFIRM_TTL, HelpMode::ListOnly)
+            .into_reply(HelpMode::ListOnly)
+            .unwrap();
+        // `reboot` has no get, so the bare verb suggests its first word.
+        assert_eq!(reply, "try 'alpha'");
+        assert!(!reply.contains("help"), "{reply}");
+    }
+
     /// The window is the one the caller is resolving with, so a deployment that
     /// configures a different one documents itself on the air rather than
     /// advertising a 30s window it does not have.
     #[test]
     fn the_confirm_window_in_help_is_the_one_asked_for() {
         let ctx = parse::parse("help reboot").unwrap();
-        let reply = static_table().resolve(&ctx, 600).into_reply().unwrap();
+        let reply = static_table()
+            .resolve(&ctx, 600, HelpMode::Full)
+            .into_reply(HelpMode::Full)
+            .unwrap();
         assert!(reply.contains("within 600s"), "{reply}");
         assert!(!reply.contains("within 30s"), "{reply}");
     }
@@ -905,7 +1060,7 @@ mod tests {
     #[test]
     fn help_for_a_query_only_verb_omits_the_word_list() {
         assert_eq!(
-            resolve("help internet").into_reply().unwrap(),
+            resolve("help internet").into_reply(HelpMode::Full).unwrap(),
             "internet: wan link"
         );
     }
@@ -913,7 +1068,7 @@ mod tests {
     #[test]
     fn help_for_an_unknown_topic_points_at_help() {
         assert_eq!(
-            resolve("help rebooot").into_reply().unwrap(),
+            resolve("help rebooot").into_reply(HelpMode::Full).unwrap(),
             "no help for 'rebooot' - try 'help'"
         );
     }
@@ -1169,7 +1324,9 @@ mod tests {
     #[test]
     fn every_help_line_fits_the_airtime_budget() {
         for topic in ["alarm", "garage", "internet", "reboot", "help"] {
-            let reply = resolve(&format!("help {topic}")).into_reply().unwrap();
+            let reply = resolve(&format!("help {topic}"))
+                .into_reply(HelpMode::Full)
+                .unwrap();
             assert!(
                 reply.len() <= MAX_REPLY_BYTES,
                 "help {topic} is {} bytes",
@@ -1252,7 +1409,11 @@ mod tests {
             // A bare verb is actionable only where the config declares a status
             // query; `reboot` has none, and `help` is handled before the table.
             let verb = table.get(name).unwrap();
-            let resolution = table.resolve(&parse::parse(name).unwrap(), loaded.confirm_ttl_secs);
+            let resolution = table.resolve(
+                &parse::parse(name).unwrap(),
+                loaded.confirm_ttl_secs,
+                HelpMode::Full,
+            );
             assert_eq!(
                 resolution.is_actionable(),
                 verb.get.is_some(),
@@ -1262,15 +1423,17 @@ mod tests {
             for word in verb.args.iter().flat_map(|a| a.words.iter()) {
                 let ctx = parse::parse(&format!("{name} {word}")).unwrap();
                 assert!(
-                    table.resolve(&ctx, loaded.confirm_ttl_secs).is_actionable(),
+                    table
+                        .resolve(&ctx, loaded.confirm_ttl_secs, HelpMode::Full)
+                        .is_actionable(),
                     "{name} {word} does not resolve"
                 );
             }
 
             let ctx = parse::parse(&format!("help {name}")).unwrap();
             let reply = table
-                .resolve(&ctx, loaded.confirm_ttl_secs)
-                .into_reply()
+                .resolve(&ctx, loaded.confirm_ttl_secs, HelpMode::Full)
+                .into_reply(HelpMode::Full)
                 .unwrap();
             assert!(reply.len() <= MAX_REPLY_BYTES, "help {name}: {reply}");
         }

@@ -630,8 +630,11 @@ Recorded so implementation doesn't relitigate them.
   silence, not `did you mean: …`. The parser is verb-shaped rather than
   sentence-shaped, so every sentence of ordinary chat is a verb guess, and a
   bot that corrects every greeting talks over the channel. The two cases that
-  already had a fallback keep it: a bad word (`garage opne` → `try 'help garage'`)
-  and a bad topic (`help rebooot` → `try 'help'`). The OSA/`edit_distance`
+  already had a fallback keep it on a full-help channel: a bad word
+  (`garage opne` → `try 'help garage'`) and a bad topic
+  (`help rebooot` → `try 'help'`). On a `bot.help_list_only` channel the bad
+  word still answers (`garage: 'opne'?`) but never mentions help, and the bad
+  topic is silent with everything else topic-shaped. The OSA/`edit_distance`
   machinery went away with the suggestions. The dropped word is logged at
   debug by `decide`, so an operator can still see it without it being on the
   air.
@@ -700,8 +703,22 @@ Recorded so implementation doesn't relitigate them.
   has no scope — otherwise there is no way to ask what is possible — but its bare
   verb list is filtered with the same predicate (`VerbSpec::available_on`), so it
   advertises only what is possible *here*. A named topic (`help reboot`) is
-  described on any channel: help is how you learn what a command does before you
-  are on the channel that runs it.
+  described on any full-help channel: help is how you learn what a command does
+  before you are on the channel that runs it.
+- **`bot.help_list_only` silences everything but the bare `help`** on the
+  channels it names (indices, each validated against `bot.channels`). A named
+  topic is a `Resolution::Silent` — understood and refused, not unmatched, and
+  logged at debug by `decide` so the silence is distinguishable from a parse
+  drop. The bare list drops its `try 'help <verb>'` pointer (advertising a
+  surface that would answer nothing), and the `no command` / `try '<word>'` /
+  bad-word replies are built without their help mention rather than built and
+  edited — a bad word still answers (`garage: 'opne'?`), it just never
+  redirects. The mode travels through `resolve`/`into_reply` as a
+  `verbs::HelpMode`, resolved once per message from the channel index via
+  `Loaded::help_mode`; `Full` is the default and byte-identical to the
+  previous behaviour. This exists for public or heavily-shared channels —
+  `#bot` in the biniou deployment — where `help reboot` would document the
+  only destructive verb for anyone who thought to ask.
 - **`decide()` is pure and takes no `MeshCore`.** All policy — parse, scope,
   resolution, latch — lives there, and `handle_message` is only the I/O around
   it. That is what makes the latch and the scope check testable on a machine
