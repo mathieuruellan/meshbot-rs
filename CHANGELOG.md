@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.10.0...v0.10.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* keep the missing-marker nudge off list-only channels ([#33](https://github.com/mathieuruellan/meshbot-rs/issues/33)) ([217530d](https://github.com/mathieuruellan/meshbot-rs/commit/217530dfc6b0df03b4e4253833f550ad1ab1e7fb))
+
 ## [0.10.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.9.0...v0.10.0) (2026-10-12)
 
 
