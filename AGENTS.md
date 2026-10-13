@@ -713,7 +713,13 @@ Recorded so implementation doesn't relitigate them.
   surface that would answer nothing), and the `no command` / `try '<word>'` /
   bad-word replies are built without their help mention rather than built and
   edited — a bad word still answers (`garage: 'opne'?`), it just never
-  redirects. The mode travels through `resolve`/`into_reply` as a
+  redirects. It also never answers a command-shaped message that lacks the `!`
+  marker: the grammar accepts any bare word as a verb, so ordinary chat
+  (`Relay`, `Pas moi.`) parses command-shaped, and the
+  `commands start with '!'` nudge fired on the family's own sentences. The
+  nudge is unchanged on a full-help channel, where it is how someone who typed
+  `reboot alpha` without the marker learns what was wrong. The mode travels
+  through `resolve`/`into_reply` as a
   `verbs::HelpMode`, resolved once per message from the channel index via
   `Loaded::help_mode`; `Full` is the default and byte-identical to the
   previous behaviour. This exists for public or heavily-shared channels —
