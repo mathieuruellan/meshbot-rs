@@ -71,10 +71,11 @@ bot:
     5: "#public"
 
   # Channels where only the bare `help` answers: a named topic (`help reboot`)
-  # is dropped, the bare list does not advertise `help <verb>`, and no reply
+  # is dropped, the bare list does not advertise `help <verb>`, no reply
   # mentions help — a bad word still answers (`garage: 'opne'?`), it just
-  # never redirects. Indices, like the channels map, and each one must be a
-  # channel `bot.channels` listens on.
+  # never redirects — and a message that merely lacks the `!` marker is chat,
+  # never the `commands start with '!'` nudge. Indices, like the channels map,
+  # and each one must be a channel `bot.channels` listens on.
   #
   # Put a public or heavily-shared channel here. `help <verb>` on such a
   # channel documents commands scoped to private ones — `help reboot` would

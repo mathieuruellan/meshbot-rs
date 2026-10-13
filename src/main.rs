@@ -508,8 +508,9 @@ fn hex(bytes: &[u8]) -> String {
 /// `MeshCore`. That is what makes the parts that must not be wrong testable on a
 /// machine with no radio attached: `handle_message` is only the I/O around it.
 enum Decision<'a> {
-    /// Nothing to say and nothing to run: chat, or a message that tried to
-    /// poison a reserved key.
+    /// Nothing to say and nothing to run: chat, a message that tried to
+    /// poison a reserved key, or — on a list-only channel — chat without the
+    /// marker that would elsewhere earn the "commands start with '!'" nudge.
     Ignore,
     Reply(String),
     Execute {
@@ -541,7 +542,8 @@ impl Decision<'_> {
 ///
 /// `help` is the channel's help mode, resolved from `bot.help_list_only` by
 /// the caller: a [`verbs::HelpMode::ListOnly`] channel takes the bare `help`
-/// and nothing else, and no reply on it may mention help.
+/// and nothing else, no reply on it may mention help, and a command-shaped
+/// message without the `!` marker earns no nudge there either.
 // Eight parameters, like `handle_message` below: each is one distinct input to
 // the decision, and grouping them into structs would only move the same fields
 // behind more names.
@@ -560,6 +562,17 @@ fn decide<'a>(
     // works on the text *after* it, never on the raw message, so the sender tag
     // and the marker cannot leak into a verb name or an argument.
     let Some(command) = parse::command_text(raw) else {
+        // A list-only channel is one the bot shares with a conversation it has
+        // no business talking over. Chat that happens to parse command-shaped
+        // (`Relay`, `Pas moi.`) is still chat there: the "commands start with
+        // '!'" nudge fired on ordinary messages and made the bot answer the
+        // family's own sentences. On a full-help channel the nudge stays -- it
+        // is how someone who typed `reboot alpha` without the marker learns
+        // what was wrong instead of wondering why nothing happened.
+        if help == verbs::HelpMode::ListOnly {
+            tracing::debug!(channel_idx, "not addressed as a command");
+            return Decision::Ignore;
+        }
         let body = parse::sender_body(raw);
         return if parse::parse_with(body, reserved).is_ok() {
             // Addressed to us and spelled correctly, but missing the marker. Say
@@ -1280,6 +1293,44 @@ mod tests {
                 .reply()
                 .is_some()
         );
+    }
+
+    // ---- the "commands start with '!'" nudge: kept on a full-help channel,
+    // ---- suppressed on a list-only one, where it talked over family chat.
+
+    /// The nudge as it has always been on a full-help channel: command-shaped
+    /// text, spelled correctly, missing only the marker — and nothing it says
+    /// may arm the latch, because the message was never a command.
+    #[test]
+    fn a_message_without_the_marker_gets_the_nudge_on_a_full_help_channel() {
+        let table = table();
+        let mut latch = new_latch();
+        let d = run_raw(table, &mut latch, "NICKNAME: komodo", ADMIN);
+        assert_eq!(d.reply(), Some("commands start with '!'"));
+
+        let d = run_raw(table, &mut latch, "NICKNAME: reboot alpha", ADMIN);
+        assert_eq!(d.reply(), Some("commands start with '!'"));
+        assert!(!latch.is_armed("reboot alpha"), "the nudge armed the latch");
+    }
+
+    /// On a list-only channel the same text is chat. The grammar accepts any
+    /// bare word as a verb, so ordinary sentences parse command-shaped — these
+    /// are the messages that earned the nudge on the family's own words.
+    #[test]
+    fn a_message_without_the_marker_is_silent_on_a_list_only_channel() {
+        let table = table();
+        let mut latch = new_latch();
+        for input in [
+            "NICKNAME: komodo",
+            "49Feneu-OS: Relay",
+            "44SHER: Pas moi.",
+            "NICKNAME: reboot alpha",
+        ] {
+            let d = run_raw(table, &mut latch, input, "#public");
+            assert_eq!(d.reply(), None, "{input} was answered on #public");
+            assert!(!d.is_execute(), "{input} ran on #public");
+        }
+        assert!(!latch.is_armed("reboot alpha"), "chat armed the latch");
     }
 
     // ---- reserved-key poisoning

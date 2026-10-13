@@ -273,10 +273,11 @@ pub const COMMAND_MARKER: char = '!';
 ///
 /// [`command_text`] no longer uses this: it anchors on the marker, so a
 /// multi-word sender name is handled. This is only for `decide`'s "commands
-/// start with '!'" nicety, where there is no marker to anchor on, and it stays
-/// deliberately conservative — one short token before the first `": "`, no
-/// leading marker, no spaces — so an ordinary sentence like `see you: ping` is
-/// not stripped and does not earn a spurious reply.
+/// start with '!'" nudge on full-help channels (a list-only channel stays
+/// silent — the nudge talked over chat), where there is no marker to anchor
+/// on, and it stays deliberately conservative — one short token before the
+/// first `": "`, no leading marker, no spaces — so an ordinary sentence like
+/// `see you: ping` is not stripped and does not earn a spurious reply.
 pub fn sender_body(text: &str) -> &str {
     // Only strip a leading sender tag if it looks like one: a single token at
     // the start, no leading '!' (so we don't confuse "!hey" as a node name),
