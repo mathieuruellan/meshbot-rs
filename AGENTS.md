@@ -10,6 +10,13 @@ this is standalone software, while `meshcore` is deployment config. It talks to
 the radio only as a plain TCP client of `meshcore-proxy` (`proxy:5000`), the same
 way mc-webui does.
 
+**`README.md` is a landing page, not documentation of record.** It exists so the
+public repo has a front page: what the bot is, the message language with
+`!ping <arg>` as the worked example, and how to run it. This file and
+`config.example.yaml` remain the docs — the README is deliberately not kept in
+step, so do not move a design decision into it, and do not trust a README line
+that contradicts `src/`.
+
 **Status: the bot now answers and acts.** Connection, channel verification, the
 grammar (`src/meshbot.pest`), the flat context with reserved-key poisoning
 (`src/parse.rs`), the verb table with the built-in, channel-scoped `help`
