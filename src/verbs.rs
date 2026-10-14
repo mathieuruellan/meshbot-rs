@@ -259,7 +259,7 @@ impl VerbTable {
     /// render `help`: the two-step line quotes how long a confirmation stays
     /// live, so a user is told rather than left to guess.
     ///
-    /// `help` is the channel's help mode: a [`HelpMode::ListOnly`] channel
+    /// `help` is the channel's help mode: a [`HelpMode::Quiet`] channel
     /// accepts the bare command and nothing else, and drops the rest here
     /// rather than in `decide`, so the whole policy lives in one place.
     pub fn resolve<'a>(
@@ -282,7 +282,7 @@ impl VerbTable {
                 _ => None,
             };
             return match ctx.target() {
-                Some(_) if help == HelpMode::ListOnly => Resolution::Silent,
+                Some(_) if help == HelpMode::Quiet => Resolution::Silent,
                 Some(topic) => self.help(Some(topic), channel, confirm_ttl_secs, help),
                 None => self.help(None, channel, confirm_ttl_secs, help),
             };
@@ -365,7 +365,7 @@ impl VerbTable {
     /// informational, and refusing to describe `reboot` on #homeassistant would
     /// leave no way to learn what it does before moving to #admin.
     ///
-    /// A [`HelpMode::ListOnly`] channel gets the bare list with no
+    /// A [`HelpMode::Quiet`] channel gets the bare list with no
     /// `try 'help <verb>'` pointer — advertising a surface that would answer
     /// nothing is worse than not mentioning it. `resolve` turns a named topic
     /// on such a channel into [`Resolution::Silent`] before this is reached.
@@ -386,7 +386,7 @@ impl VerbTable {
                 return Resolution::Help("no verbs on this channel".to_string());
             }
             let line = match help {
-                HelpMode::ListOnly => format!("verbs: {}", names.join(" ")),
+                HelpMode::Quiet => format!("verbs: {}", names.join(" ")),
                 HelpMode::Full => format!("verbs: {} | try 'help <verb>'", names.join(" ")),
             };
             return Resolution::Help(clamp(&line, MAX_REPLY_BYTES));
@@ -422,11 +422,16 @@ impl VerbTable {
 /// and there a full help is both noise and an oracle: `help reboot` would
 /// document a destructive command scoped to a private channel, and every
 /// `try 'help …'` hint would advertise a surface that is then refused. So such
-/// a channel gets [`HelpMode::ListOnly`]: the bare `help` lists what answers
+/// a channel gets [`HelpMode::Quiet`]: the bare `help` lists what answers
 /// *here*, and nothing else mentions help at all.
 ///
-/// Configured with `bot.help_list_only`; absent means [`HelpMode::Full`],
-/// which is the behaviour every channel had before the key existed.
+/// Configured as `quiet: true` on the `bot.channels` entry for that channel;
+/// absent means [`HelpMode::Full`], which is the default every channel gets.
+///
+/// Note the word "quiet" is narrower here than [`Resolution::Silent`]: this is
+/// a property of the *channel* — how much help it exposes — while `Silent` is
+/// an outcome for one *message* that was understood and deliberately refused.
+/// A quiet channel still transmits: commands scoped to it answer normally.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HelpMode {
     /// `help` lists this channel's verbs and points at `help <verb>`;
@@ -437,7 +442,7 @@ pub enum HelpMode {
     Full,
     /// Only the bare `help` answers, without advertising topics; a named
     /// topic is dropped and no reply mentions help.
-    ListOnly,
+    Quiet,
 }
 
 /// What a message turned out to mean.
@@ -445,7 +450,7 @@ pub enum HelpMode {
 pub enum Resolution<'a> {
     /// A reply the bot can send verbatim. Carries the whole `help` surface.
     Help(String),
-    /// Deliberately no reply: a named help topic on a [`HelpMode::ListOnly`]
+    /// Deliberately no reply: a named help topic on a [`HelpMode::Quiet`]
     /// channel. Distinct from [`Resolution::UnknownVerb`] because the input
     /// *was* understood — it is refused, not unmatched — so `decide` logs it
     /// as a suppression rather than as an unknown verb.
@@ -493,7 +498,7 @@ pub enum Resolution<'a> {
 impl<'a> Resolution<'a> {
     /// The reply to send when nothing may be run.
     ///
-    /// `help` is the channel's help mode: on a [`HelpMode::ListOnly`] channel
+    /// `help` is the channel's help mode: on a [`HelpMode::Quiet`] channel
     /// no reply may point at help, so the hints below are built without it
     /// rather than built and then edited.
     pub fn into_reply(self, help: HelpMode) -> Option<String> {
@@ -502,15 +507,15 @@ impl<'a> Resolution<'a> {
             Self::Silent => None,
             Self::NoVerb => Some(match help {
                 HelpMode::Full => "no command - try 'help'".to_string(),
-                HelpMode::ListOnly => "no command".to_string(),
+                HelpMode::Quiet => "no command".to_string(),
             }),
             Self::NoQuery { suggestion, .. } => Some(match (suggestion, help) {
                 (Some(s), HelpMode::Full) => format!("try '{s}' or 'help'"),
-                (Some(s), HelpMode::ListOnly) => format!("try '{s}'"),
+                (Some(s), HelpMode::Quiet) => format!("try '{s}'"),
                 // With no word to suggest and no help to point at, there is
                 // nothing worth a transmission.
                 (None, HelpMode::Full) => "try 'help'".to_string(),
-                (None, HelpMode::ListOnly) => return None,
+                (None, HelpMode::Quiet) => return None,
             }),
             // Silence, deliberately, and for every unknown word rather than
             // only the far ones. The parser is verb-shaped rather than
@@ -520,11 +525,11 @@ impl<'a> Resolution<'a> {
             Self::UnknownVerb { .. } => None,
             Self::BadArg { verb, input } => {
                 // The bad word itself is always worth saying — on a
-                // ListOnly channel the reply still answers, it just never
+                // Quiet channel the reply still answers, it just never
                 // redirects to help.
                 let line = match help {
                     HelpMode::Full => format!("{verb}: '{input}'? try 'help {verb}'"),
-                    HelpMode::ListOnly => format!("{verb}: '{input}'?"),
+                    HelpMode::Quiet => format!("{verb}: '{input}'?"),
                 };
                 Some(clamp(&line, MAX_REPLY_BYTES))
             }
@@ -1125,7 +1130,7 @@ mod tests {
                 "{input} was answered"
             );
             assert_eq!(
-                resolve_gated(&input).into_reply(HelpMode::ListOnly),
+                resolve_gated(&input).into_reply(HelpMode::Quiet),
                 None,
                 "{input} was answered"
             );
@@ -1139,7 +1144,7 @@ mod tests {
         let res = resolve_gated("ping");
         assert!(matches!(&res, Resolution::NeedsArg { .. }), "{res:?}");
         assert_eq!(res.into_reply(HelpMode::Full), None);
-        assert_eq!(resolve_gated("ping  ").into_reply(HelpMode::ListOnly), None);
+        assert_eq!(resolve_gated("ping  ").into_reply(HelpMode::Quiet), None);
     }
 
     /// Case-insensitivity is a property of how the pattern is *compiled*, so it
@@ -1240,42 +1245,42 @@ mod tests {
         assert!(reply.len() <= MAX_REPLY_BYTES);
     }
 
-    // ---- HelpMode::ListOnly: the bare command answers, nothing else does
+    // ---- HelpMode::Quiet: the bare command answers, nothing else does
 
     /// The whole point of the mode: on a public channel a named topic is
     /// both noise and an oracle — it would document a destructive command
     /// scoped to a private channel for anyone who thought to ask.
     #[test]
-    fn a_named_topic_is_silent_on_a_list_only_channel() {
-        let reboot = resolve_on_in("help reboot", "#admin", HelpMode::ListOnly);
+    fn a_named_topic_is_silent_on_a_quiet_channel() {
+        let reboot = resolve_on_in("help reboot", "#admin", HelpMode::Quiet);
         assert_eq!(reboot, Resolution::Silent);
-        assert_eq!(reboot.into_reply(HelpMode::ListOnly), None);
+        assert_eq!(reboot.into_reply(HelpMode::Quiet), None);
 
         // Even a topic that belongs *here* is refused: the mode is about the
         // channel, not about the verb's scope.
-        let garage = resolve_on_in("help garage", "#homeassistant", HelpMode::ListOnly);
-        assert_eq!(garage.into_reply(HelpMode::ListOnly), None);
+        let garage = resolve_on_in("help garage", "#homeassistant", HelpMode::Quiet);
+        assert_eq!(garage.into_reply(HelpMode::Quiet), None);
 
         // And so is a typo'd topic: no `no help for '…' - try 'help'` either.
-        let typo = resolve_on_in("help rebooot", "#admin", HelpMode::ListOnly);
-        assert_eq!(typo.into_reply(HelpMode::ListOnly), None);
+        let typo = resolve_on_in("help rebooot", "#admin", HelpMode::Quiet);
+        assert_eq!(typo.into_reply(HelpMode::Quiet), None);
     }
 
     /// The bare command still answers — it is the one surface the mode keeps —
     /// but it no longer advertises a topic surface that would answer nothing.
     #[test]
-    fn bare_help_on_a_list_only_channel_lists_without_the_pointer() {
-        let reply = resolve_on_in("help", "#homeassistant", HelpMode::ListOnly)
-            .into_reply(HelpMode::ListOnly)
+    fn bare_help_on_a_quiet_channel_lists_without_the_pointer() {
+        let reply = resolve_on_in("help", "#homeassistant", HelpMode::Quiet)
+            .into_reply(HelpMode::Quiet)
             .unwrap();
         assert_eq!(reply, "verbs: alarm garage");
         assert!(!reply.contains("help"), "{reply}");
     }
 
     #[test]
-    fn bare_help_on_a_list_only_channel_with_no_verbs_still_says_so() {
-        let reply = resolve_on_in("help", "#family", HelpMode::ListOnly)
-            .into_reply(HelpMode::ListOnly)
+    fn bare_help_on_a_quiet_channel_with_no_verbs_still_says_so() {
+        let reply = resolve_on_in("help", "#family", HelpMode::Quiet)
+            .into_reply(HelpMode::Quiet)
             .unwrap();
         assert_eq!(reply, "no verbs on this channel");
     }
@@ -1283,27 +1288,27 @@ mod tests {
     /// A bad word is still worth saying out loud — the mode silences help,
     /// not the answer to "why did nothing happen".
     #[test]
-    fn a_bad_arg_still_answers_on_a_list_only_channel_without_pointing_at_help() {
-        let reply = resolve_in("garage opne", HelpMode::ListOnly)
-            .into_reply(HelpMode::ListOnly)
+    fn a_bad_arg_still_answers_on_a_quiet_channel_without_pointing_at_help() {
+        let reply = resolve_in("garage opne", HelpMode::Quiet)
+            .into_reply(HelpMode::Quiet)
             .unwrap();
         assert_eq!(reply, "garage: 'opne'?");
         assert!(!reply.contains("help"), "{reply}");
     }
 
     #[test]
-    fn no_command_hint_drops_help_on_a_list_only_channel() {
+    fn no_command_hint_drops_help_on_a_quiet_channel() {
         // NoVerb is the resolution for a context with no verb at all.
-        let reply = Resolution::NoVerb.into_reply(HelpMode::ListOnly).unwrap();
+        let reply = Resolution::NoVerb.into_reply(HelpMode::Quiet).unwrap();
         assert_eq!(reply, "no command");
     }
 
     #[test]
-    fn a_no_query_hint_keeps_the_word_and_drops_help_on_a_list_only_channel() {
+    fn a_no_query_hint_keeps_the_word_and_drops_help_on_a_quiet_channel() {
         let ctx = parse::parse("reboot").unwrap();
         let reply = static_table()
-            .resolve(&ctx, CONFIRM_TTL, HelpMode::ListOnly)
-            .into_reply(HelpMode::ListOnly)
+            .resolve(&ctx, CONFIRM_TTL, HelpMode::Quiet)
+            .into_reply(HelpMode::Quiet)
             .unwrap();
         // `reboot` has no get, so the bare verb suggests its first word.
         assert_eq!(reply, "try 'alpha'");

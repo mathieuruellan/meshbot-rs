@@ -273,7 +273,7 @@ pub const COMMAND_MARKER: char = '!';
 ///
 /// [`command_text`] no longer uses this: it anchors on the marker, so a
 /// multi-word sender name is handled. This is only for `decide`'s "commands
-/// start with '!'" nudge on full-help channels (a list-only channel stays
+/// start with '!'" nudge on full-help channels (a quiet channel stays
 /// silent — the nudge talked over chat), where there is no marker to anchor
 /// on, and it stays deliberately conservative — one short token before the
 /// first `": "`, no leading marker, no spaces — so an ordinary sentence like

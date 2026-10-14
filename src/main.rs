@@ -509,7 +509,7 @@ fn hex(bytes: &[u8]) -> String {
 /// machine with no radio attached: `handle_message` is only the I/O around it.
 enum Decision<'a> {
     /// Nothing to say and nothing to run: chat, a message that tried to
-    /// poison a reserved key, or — on a list-only channel — chat without the
+    /// poison a reserved key, or — on a quiet channel — chat without the
     /// marker that would elsewhere earn the "commands start with '!'" nudge.
     Ignore,
     Reply(String),
@@ -540,10 +540,11 @@ impl Decision<'_> {
 
 /// Decide what one inbound message means. Pure apart from the latch's clock.
 ///
-/// `help` is the channel's help mode, resolved from `bot.help_list_only` by
-/// the caller: a [`verbs::HelpMode::ListOnly`] channel takes the bare `help`
-/// and nothing else, no reply on it may mention help, and a command-shaped
-/// message without the `!` marker earns no nudge there either.
+/// `help` is the channel's help mode, resolved from the `quiet` flag on the
+/// `bot.channels` entry by the caller: a [`verbs::HelpMode::Quiet`] channel
+/// takes the bare `help` and nothing else, no reply on it may mention help,
+/// and a command-shaped message without the `!` marker earns no nudge there
+/// either.
 // Eight parameters, like `handle_message` below: each is one distinct input to
 // the decision, and grouping them into structs would only move the same fields
 // behind more names.
@@ -562,14 +563,14 @@ fn decide<'a>(
     // works on the text *after* it, never on the raw message, so the sender tag
     // and the marker cannot leak into a verb name or an argument.
     let Some(command) = parse::command_text(raw) else {
-        // A list-only channel is one the bot shares with a conversation it has
+        // A quiet channel is one the bot shares with a conversation it has
         // no business talking over. Chat that happens to parse command-shaped
         // (`Relay`, `Pas moi.`) is still chat there: the "commands start with
         // '!'" nudge fired on ordinary messages and made the bot answer the
         // family's own sentences. On a full-help channel the nudge stays -- it
         // is how someone who typed `reboot alpha` without the marker learns
         // what was wrong instead of wondering why nothing happened.
-        if help == verbs::HelpMode::ListOnly {
+        if help == verbs::HelpMode::Quiet {
             tracing::debug!(channel_idx, "not addressed as a command");
             return Decision::Ignore;
         }
@@ -708,7 +709,7 @@ fn decide<'a>(
         // configured to take only the bare `help`. Debug, so a silence on air
         // is still a line in the log rather than looking like a parse drop.
         verbs::Resolution::Silent => {
-            tracing::debug!(channel_idx, "help topic suppressed on a list-only channel");
+            tracing::debug!(channel_idx, "help topic suppressed on a quiet channel");
             Decision::Ignore
         }
         // A pattern-gated verb, refused for want of an acceptable argument.
@@ -1309,20 +1310,17 @@ mod tests {
         assert!(reply.starts_with("reboot:"), "{reply}");
     }
 
-    // ---- `bot.help_list_only`: the #public example channel takes only the
-    // ---- bare `help`, and nothing on it may mention help.
+    // ---- `quiet: true` on a `bot.channels` entry: the #public example channel
+    // ---- takes only the bare `help`, and nothing on it may mention help.
 
     /// The one surface the mode keeps: the bare command answers, filtered to
     /// this channel like anywhere else, but without advertising topics.
     #[test]
-    fn bare_help_still_answers_on_a_list_only_channel() {
+    fn bare_help_still_answers_on_a_quiet_channel() {
         let table = table();
         let mut latch = new_latch();
         let d = run_on(table, &mut latch, "help", "#public");
-        let reply = d
-            .reply()
-            .expect("bare help on a list-only channel")
-            .to_string();
+        let reply = d.reply().expect("bare help on a quiet channel").to_string();
         // #public has no verbs in the example config.
         assert_eq!(reply, "no verbs on this channel");
     }
@@ -1330,7 +1328,7 @@ mod tests {
     /// A named topic is understood and refused: no description of a verb from
     /// a private channel, and no `no help for '…'` for a typo either.
     #[test]
-    fn a_help_topic_is_dropped_on_a_list_only_channel() {
+    fn a_help_topic_is_dropped_on_a_quiet_channel() {
         let table = table();
         let mut latch = new_latch();
         for input in ["help reboot", "help alarm", "help nope"] {
@@ -1353,7 +1351,7 @@ mod tests {
     }
 
     // ---- the "commands start with '!'" nudge: kept on a full-help channel,
-    // ---- suppressed on a list-only one, where it talked over family chat.
+    // ---- suppressed on a quiet one, where it talked over family chat.
 
     /// The nudge as it has always been on a full-help channel: command-shaped
     /// text, spelled correctly, missing only the marker — and nothing it says
@@ -1370,11 +1368,11 @@ mod tests {
         assert!(!latch.is_armed("reboot alpha"), "the nudge armed the latch");
     }
 
-    /// On a list-only channel the same text is chat. The grammar accepts any
+    /// On a quiet channel the same text is chat. The grammar accepts any
     /// bare word as a verb, so ordinary sentences parse command-shaped — these
     /// are the messages that earned the nudge on the family's own words.
     #[test]
-    fn a_message_without_the_marker_is_silent_on_a_list_only_channel() {
+    fn a_message_without_the_marker_is_silent_on_a_quiet_channel() {
         let table = table();
         let mut latch = new_latch();
         for input in [
