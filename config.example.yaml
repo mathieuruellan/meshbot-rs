@@ -22,7 +22,10 @@ schema: 1
 #
 # The verb is the only positional argument, and a bare word must be one a verb
 # declares. That is what makes it impossible for a message to name a host: the
-# word is a lookup key, never a target. Slots are `key=value`; `/`, quotes and
+# word is a lookup key, never a target. `arg_pattern` is the one exception: it
+# lets a verb accept free text as its argument, but only as a yes/no gate on
+# whether the verb fires — the loader refuses `{{target}}` on such a verb, so
+# the text still never reaches a template or a script (see `ping` below). Slots are `key=value`; `/`, quotes and
 # a second `=` are rejected inside a word, so no path or hidden slot can be
 # smuggled in. Input over 64 bytes, or containing a newline, tab or carriage
 # return, is refused before parsing.
@@ -205,6 +208,21 @@ verbs:
   - name: ping
     desc: "hops, delay and repeaters of your message"
     channel: "#admin"
+    # `arg_pattern` is what makes the verb take an argument. The bare `ping` is
+    # a missing argument and `ping bonjour` is a word the pattern refuses; both
+    # are dropped in silence (logged at debug, nothing transmitted), and only
+    # `ping nantes` fires.
+    #
+    # The pattern is an unanchored search, so it is a *contains* test, and it is
+    # compiled case-insensitively every time — no `(?i)` to remember. Two
+    # spellings are worth knowing: a literal `*` must be written `[*]`, because
+    # a bare one is not a regular expression at all, and YAML would read a
+    # leading `*` as an alias anyway.
+    #
+    # An invalid pattern is a startup error, as is combining this key with
+    # `args:`, or with `{{target}}` in the action: the argument is free message
+    # text, so a verb gated by a pattern may not put it on the air.
+    arg_pattern: "[*]|eu|fr|fr-44|nantes|nte|landreau"
     # A reply-only action: no script, because everything it reports comes from
     # the message metadata the engine injects. `{{sender}}` is the sender's
     # nickname quoted verbatim (or `?` when the client sends no tag), `{{hops}}`

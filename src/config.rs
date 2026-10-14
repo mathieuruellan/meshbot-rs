@@ -319,6 +319,43 @@ fn validate_verbs(verbs: &[VerbSpec], channels: &[(u8, String)], dir: &Path) -> 
             listened.iter().cloned().collect::<Vec<_>>().join(", ")
         );
 
+        // `arg_pattern` takes the verb's one positional argument: it gates the
+        // argument rather than sitting beside declared words, so the two can
+        // never both be reachable — and a verb with nothing to fire once the
+        // argument passed would be gating nothing. Checked before the general
+        // "can never fire" rule below so the error names the key at fault.
+        if let Some(pattern) = &verb.arg_pattern {
+            ensure!(
+                verb.args.is_empty(),
+                "verb {name:?} declares arg_pattern and args; the pattern takes the one \
+                 positional argument, so those words could never be reached"
+            );
+            ensure!(
+                verb.get.is_some(),
+                "verb {name:?} declares arg_pattern but no get; there would be nothing to fire \
+                 once the argument matched"
+            );
+            ensure!(
+                !pattern.as_str().is_empty(),
+                "verb {name:?} has an empty arg_pattern, which matches every argument; omit the \
+                 key if requiring an argument is all it should do"
+            );
+            // The argument the pattern gates is free message text, and the
+            // parser has put it in the context as `target` — that is how the
+            // verb saw it in the first place. `{{target}}` is therefore the one
+            // placeholder that would carry it into a reply or a script argv,
+            // which is exactly what a pattern-gated verb must not do.
+            if let Some(get) = &verb.get {
+                let leaks_arg = uses_placeholder(&get.reply, "target")
+                    || get.args.iter().any(|a| uses_placeholder(a, "target"));
+                ensure!(
+                    !leaks_arg,
+                    "verb {name:?} declares arg_pattern, so its argument is free message text; \
+                     {{{{target}}}} would put it straight into the action"
+                );
+            }
+        }
+
         ensure!(
             verb.get.is_some() || !verb.args.is_empty(),
             "verb {name:?} has neither a get nor any args, so it can never fire"
@@ -419,6 +456,15 @@ fn validate_action(
     }
 
     Ok(())
+}
+
+/// Whether `template` references `{{name}}`.
+///
+/// Used where the question is "does this template read that value" rather than
+/// "may it": a match on the whole placeholder, so `{{targetx}}` is not
+/// `{{target}}`.
+fn uses_placeholder(template: &str, name: &str) -> bool {
+    template.contains(&format!("{{{{{name}}}}}"))
 }
 
 /// Reject a template the engine cannot fill.
@@ -785,5 +831,101 @@ mod tests {
         // The example declares the window outright rather than relying on the
         // default, so a change to either side shows up here.
         assert_eq!(loaded.confirm_ttl_secs, 60);
+    }
+
+    // ---- `arg_pattern`
+
+    #[test]
+    fn an_arg_pattern_is_compiled_at_load() {
+        let loaded = config(
+            "  - name: ping\n    channel: admin\n    arg_pattern: nantes\n    get:\n      reply: up\n",
+        )
+        .unwrap();
+        let verb = loaded.table.get("ping").expect("ping is declared");
+        let pattern = verb.arg_pattern.as_ref().expect("carried through");
+        // Case-insensitivity is set by the compiler, not written in the pattern.
+        assert!(pattern.matches("Nantes-44"));
+        assert!(!pattern.matches("rennes"));
+    }
+
+    /// A pattern that does not compile must stop the bot at startup rather than
+    /// fail per message — silently, since a refused argument is never answered.
+    ///
+    /// `{err:#}` because anyhow's `Display` is only the outermost context; the
+    /// loader wraps the parse error, and the reason is the reason.
+    #[test]
+    fn an_invalid_arg_pattern_is_fatal() {
+        let err = config(
+            "  - name: ping\n    channel: admin\n    arg_pattern: \"(\"\n    get:\n      reply: up\n",
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("arg_pattern"), "{err}");
+    }
+
+    /// An empty pattern matches everything, so the key would say "require an
+    /// argument" in the least legible way possible. Refused, with the reason
+    /// and the simpler thing to do instead.
+    #[test]
+    fn an_empty_arg_pattern_is_fatal() {
+        let err = config(
+            "  - name: ping\n    channel: admin\n    arg_pattern: \"\"\n    get:\n      reply: up\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("empty arg_pattern"), "{err}");
+        assert!(err.contains("omit the key"), "{err}");
+    }
+
+    /// The pattern takes the verb's one positional argument, so declared words
+    /// beside it could never fire — a config that asks for both is a mistake,
+    /// not a precedence rule to guess at.
+    #[test]
+    fn arg_pattern_cannot_share_a_verb_with_declared_words() {
+        let err = config(
+            "  - name: garage\n    channel: admin\n    arg_pattern: open\n    get:\n      script: ok.sh\n      reply: up\n    args:\n      - words: [open]\n        action:\n          script: ok.sh\n          reply: up\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("arg_pattern and args"), "{err}");
+    }
+
+    /// Without a `get` there is nothing to run once the argument passes, and
+    /// the declared words are refused anyway — so the verb would gate itself.
+    #[test]
+    fn arg_pattern_without_a_get_is_fatal() {
+        let err = config("  - name: ping\n    channel: admin\n    arg_pattern: nantes\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("arg_pattern but no get"), "{err}");
+    }
+
+    /// The argument the pattern gates is free message text sitting in the
+    /// context as `target`, so `{{target}}` is the one placeholder that would
+    /// carry it into a reply or a script argv.
+    #[test]
+    fn a_pattern_gated_verb_may_not_expand_the_argument() {
+        for template in ["\"{{target}}\"", "\"ping {{target}}\"", "\"{{target}}!\""] {
+            let raw = format!(
+                "  - name: ping\n    channel: admin\n    arg_pattern: nantes\n    get:\n      reply: {template}\n"
+            );
+            let err = config(&raw).unwrap_err().to_string();
+            assert!(err.contains("free message text"), "{err}");
+        }
+        // An argument is the same leak, by a different route.
+        let err = config(
+            "  - name: ping\n    channel: admin\n    arg_pattern: nantes\n    get:\n      script: ok.sh\n      args: [\"{{target}}\"]\n      reply: up\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("free message text"), "{err}");
+
+        // And the same verb without the placeholder is fine, which is what
+        // makes the failure above about the placeholder rather than about the
+        // combination.
+        assert!(config(
+            "  - name: ping\n    channel: admin\n    arg_pattern: nantes\n    get:\n      reply: up\n"
+        )
+        .is_ok());
     }
 }

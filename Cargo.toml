@@ -15,6 +15,11 @@ futures = "0.3.34"
 meshcore-rs = { version = "=0.2.0", default-features = false, features = ["tcp"] }
 pest = "2.9.2"
 pest_derive = "2.9.2"
+# One user: a verb's `arg_pattern`, the regex its single positional argument is
+# matched against. It is compiled at config load and applied to that one
+# declared slot, never to raw message text. The crate is linear-time, so a
+# hostile pattern is a startup error rather than a hang.
+regex = "1"
 # Actions are scripts, not HTTP. The config loader that will read verb entries
 # from YAML needs this; nothing reads YAML yet.
 serde = { version = "1.0.229", features = ["derive"] }

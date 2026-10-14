@@ -711,6 +711,25 @@ fn decide<'a>(
             tracing::debug!(channel_idx, "help topic suppressed on a list-only channel");
             Decision::Ignore
         }
+        // A pattern-gated verb, refused for want of an acceptable argument.
+        // Debug rather than info: `arg_pattern` exists to keep a shared channel
+        // quiet, and an info line per refused word would be the same noise in
+        // the log that it is on the air. The two reasons are logged apart, so a
+        // silence still has a traceable cause instead of looking like a parse
+        // drop.
+        verbs::Resolution::NeedsArg { verb } => {
+            tracing::debug!(channel_idx, verb = %verb.name, "argument required");
+            Decision::Ignore
+        }
+        verbs::Resolution::ArgNoMatch { verb, input } => {
+            tracing::debug!(
+                channel_idx,
+                verb = %verb.name,
+                arg = %input,
+                "argument did not match arg_pattern"
+            );
+            Decision::Ignore
+        }
         other => match other.into_reply(help) {
             Some(reply) => Decision::Reply(reply),
             None => Decision::Ignore,
@@ -1163,6 +1182,44 @@ mod tests {
         let mut latch = new_latch();
         assert!(run_on(table, &mut latch, "garage open", HA).is_execute());
         assert!(run_on(table, &mut latch, "alarm arm", HA).is_execute());
+    }
+
+    // ---- `arg_pattern`, end to end through `decide`: the example config's
+    // ---- `ping` takes an argument, and answers only when the pattern likes it.
+
+    /// The three outcomes of a gated verb in one place: a matching argument
+    /// runs, and a missing one or a refused one is a silence with no reply
+    /// attached — which is what the gate exists for on a shared channel.
+    #[test]
+    fn ping_answers_only_on_a_matching_argument() {
+        let table = table();
+        let mut latch = new_latch();
+
+        for input in ["ping nantes", "ping Nantes-44", "ping *"] {
+            assert!(
+                run_on(table, &mut latch, input, ADMIN).is_execute(),
+                "{input} did not fire"
+            );
+            assert_eq!(latch.armed_count(), 0, "{input} armed something");
+        }
+
+        for input in ["ping", "ping bonjour", "ping 1234"] {
+            let d = run_on(table, &mut latch, input, ADMIN);
+            assert!(!d.is_execute(), "{input} fired");
+            assert_eq!(d.reply(), None, "{input} was answered");
+            assert_eq!(latch.armed_count(), 0, "{input} armed something");
+        }
+    }
+
+    /// Channel scope is checked before resolution, so the gate cannot grant a
+    /// channel the verb was never declared for.
+    #[test]
+    fn the_gate_does_not_override_channel_scope() {
+        let table = table();
+        let mut latch = new_latch();
+        let d = run_on(table, &mut latch, "ping nantes", HA);
+        assert!(!d.is_execute());
+        assert_eq!(d.reply(), Some("ping: not on this channel"));
     }
 
     // ---- channel scope
@@ -1836,9 +1893,13 @@ mod tests {
     fn a_command_context_carries_the_senders_nickname() {
         let table = table();
         let mut latch = new_latch();
-        let Decision::Execute { ctx, .. } =
-            run_raw(table, &mut latch, "✊FR44TRIG-c14 fixe: !ping", ADMIN)
-        else {
+        // `ping` is pattern-gated, so the command carries its argument.
+        let Decision::Execute { ctx, .. } = run_raw(
+            table,
+            &mut latch,
+            "✊FR44TRIG-c14 fixe: !ping nantes",
+            ADMIN,
+        ) else {
             panic!("expected Execute");
         };
         assert_eq!(
@@ -1853,7 +1914,8 @@ mod tests {
     fn a_bare_command_gets_the_sender_placeholder() {
         let table = table();
         let mut latch = new_latch();
-        let Decision::Execute { ctx, .. } = run_raw(table, &mut latch, "!ping", ADMIN) else {
+        let Decision::Execute { ctx, .. } = run_raw(table, &mut latch, "!ping nantes", ADMIN)
+        else {
             panic!("expected Execute");
         };
         assert_eq!(

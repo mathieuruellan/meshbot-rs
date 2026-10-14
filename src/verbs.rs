@@ -67,6 +67,73 @@ pub struct ActionSpec {
     pub timeout_secs: Option<u64>,
 }
 
+/// A verb's `arg_pattern`: the regex its single positional argument must match
+/// before the verb can fire.
+///
+/// Compiled at config load, never at message time, and **case-insensitive by
+/// construction**: an operator editing the pattern cannot write one that only
+/// matches by accident of case, and a message never meets an uncompiled regex.
+/// Matching is an unanchored search, so `is_match` is a *contains* test — which
+/// is what writing `nantes` rather than `^nantes$` means.
+///
+/// The pattern sees exactly one argument — the verb's own positional one — and
+/// nothing else: the sender tag, the marker and the rest of the message never
+/// reach it. What it does *not* do is turn that argument into a value — it
+/// decides whether the verb fires, and the loader refuses `{{target}}` on a
+/// verb that declares a pattern, so an argument that passed the gate still
+/// never reaches a reply or a script.
+#[derive(Debug, Clone)]
+pub struct Pattern(regex::Regex);
+
+impl Pattern {
+    /// Compile `raw`, case-insensitively. An invalid pattern is a config error
+    /// at load rather than a failure at message time.
+    pub fn new(raw: &str) -> Result<Self, regex::Error> {
+        regex::RegexBuilder::new(raw)
+            .case_insensitive(true)
+            .build()
+            .map(Self)
+    }
+
+    /// Whether `arg` satisfies the pattern. Unanchored: a contains test.
+    pub fn matches(&self, arg: &str) -> bool {
+        self.0.is_match(arg)
+    }
+
+    /// The pattern as it was written, for error messages.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// Two patterns are equal when they are written the same way. Case-folding is
+/// not part of the string because [`Pattern::new`] always turns it on. Written
+/// by hand rather than derived: `regex::Regex` implements `PartialEq` but not
+/// `Eq`, and `VerbSpec` derives `Eq`.
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for Pattern {}
+
+/// Deserialize from the plain string in `config.yaml`, compiling it.
+///
+/// This is where "an invalid regex is a startup error" happens: the message
+/// carries the regex crate's own parse report, and serde adds the line and
+/// column of the pattern in the file.
+impl<'de> serde::Deserialize<'de> for Pattern {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(&raw)
+            .map_err(|err| serde::de::Error::custom(format!("invalid arg_pattern: {err}")))
+    }
+}
+
 /// One enum value of a verb, e.g. `open` of `garage`.
 ///
 /// The action is nested under `action:` rather than inlined alongside `words`:
@@ -95,6 +162,20 @@ pub struct VerbSpec {
     /// The action for a bare `verb`, i.e. the status query.
     #[serde(default)]
     pub get: Option<ActionSpec>,
+    /// A regex the verb's single positional argument must match for the verb to
+    /// fire, e.g. `"[*]|eu|fr|fr-44|nantes"`.
+    ///
+    /// Present means the verb **takes** an argument: a bare `verb` is a missing
+    /// one, and an argument the pattern refuses is dropped in silence. Both are
+    /// logged, so an operator chasing "why did nothing happen" finds the reason.
+    ///
+    /// It takes the argument slot whole, so a verb declaring it must not also
+    /// declare `args:` words (the loader refuses the combination), must have a
+    /// `get` to fire once the argument passes, and that `get` may not use
+    /// `{{target}}` — the one placeholder that would carry free message text
+    /// back out to the air. See [`Pattern`] for what the pattern can see.
+    #[serde(default)]
+    pub arg_pattern: Option<Pattern>,
     #[serde(default)]
     pub args: Vec<ArgSpec>,
 }
@@ -218,6 +299,10 @@ impl VerbTable {
 
         match ctx.target() {
             None => match &verb.get {
+                // A pattern-gated verb cannot answer without an argument: the
+                // pattern is the reason it takes one, so the bare verb is a
+                // missing argument rather than a query to run.
+                Some(_) if verb.arg_pattern.is_some() => Resolution::NeedsArg { verb },
                 Some(action) => Resolution::Fire {
                     verb,
                     action,
@@ -228,21 +313,47 @@ impl VerbTable {
                     suggestion: verb.primary_word(),
                 },
             },
-            Some(word) => match verb
-                .args
-                .iter()
-                .find(|a| a.words.iter().any(|w| w.eq_ignore_ascii_case(word)))
-            {
-                Some(arg) => Resolution::Fire {
-                    verb,
-                    action: &arg.action,
-                    word: Some(arg.words[0].clone()),
-                },
-                None => Resolution::BadArg {
-                    verb,
-                    input: word.to_string(),
-                },
-            },
+            Some(word) => {
+                if let (Some(pattern), Some(action)) = (&verb.arg_pattern, &verb.get) {
+                    // The pattern takes the argument slot whole, so there is no
+                    // declared word to look up. `word` stays `None`: it reports
+                    // the declared spelling a word resolved to, and free
+                    // message text is not that. The argument still cannot leave
+                    // through a template, because the loader refuses
+                    // `{{target}}` on a verb that declares a pattern.
+                    if pattern.matches(word) {
+                        Resolution::Fire {
+                            verb,
+                            action,
+                            word: None,
+                        }
+                    } else {
+                        Resolution::ArgNoMatch {
+                            verb,
+                            input: word.to_string(),
+                        }
+                    }
+                } else {
+                    // No pattern — or a pattern on a verb with no `get`, which
+                    // the loader refuses, so only a table built in code reaches
+                    // this arm with one.
+                    match verb
+                        .args
+                        .iter()
+                        .find(|a| a.words.iter().any(|w| w.eq_ignore_ascii_case(word)))
+                    {
+                        Some(arg) => Resolution::Fire {
+                            verb,
+                            action: &arg.action,
+                            word: Some(arg.words[0].clone()),
+                        },
+                        None => Resolution::BadArg {
+                            verb,
+                            input: word.to_string(),
+                        },
+                    }
+                }
+            }
         }
     }
 
@@ -363,6 +474,20 @@ pub enum Resolution<'a> {
         verb: &'a VerbSpec,
         input: String,
     },
+    /// The verb declares an `arg_pattern`, so it takes an argument, and the
+    /// message carried none.
+    NeedsArg {
+        verb: &'a VerbSpec,
+    },
+    /// The verb declares an `arg_pattern` and the argument did not satisfy it.
+    ///
+    /// `input` is what was typed, kept for the log — never for a reply: the
+    /// drop is silent on the air, and an operator chasing it needs the word
+    /// that was refused.
+    ArgNoMatch {
+        verb: &'a VerbSpec,
+        input: String,
+    },
 }
 
 impl<'a> Resolution<'a> {
@@ -403,6 +528,13 @@ impl<'a> Resolution<'a> {
                 };
                 Some(clamp(&line, MAX_REPLY_BYTES))
             }
+            // Silence, deliberately, and for the same reason as an unknown
+            // verb: `arg_pattern` exists to keep a shared channel quiet, so
+            // answering "that word does not match" would put the bot back
+            // over the conversation it was configured to stay out of. `decide`
+            // logs which of the two it was, so the reason survives in the log
+            // even though nothing is transmitted.
+            Self::NeedsArg { .. } | Self::ArgNoMatch { .. } => None,
             Self::Fire { .. } => None,
         }
     }
@@ -637,6 +769,7 @@ mod tests {
                 desc: "alarm state".into(),
                 channel: Some("#homeassistant".into()),
                 get: Some(status_action()),
+                arg_pattern: None,
                 args: vec![
                     ArgSpec {
                         words: vec!["arm".into(), "on".into(), "lock".into()],
@@ -653,6 +786,7 @@ mod tests {
                 desc: "garage door".into(),
                 channel: Some("#homeassistant".into()),
                 get: Some(status_action()),
+                arg_pattern: None,
                 args: vec![ArgSpec {
                     words: vec!["open".into(), "up".into()],
                     action: mutating_action(false),
@@ -663,6 +797,7 @@ mod tests {
                 desc: "wan link".into(),
                 channel: Some("#admin".into()),
                 get: Some(status_action()),
+                arg_pattern: None,
                 args: vec![],
             },
             VerbSpec {
@@ -670,6 +805,7 @@ mod tests {
                 desc: "reboot a host".into(),
                 channel: Some("#admin".into()),
                 get: None,
+                arg_pattern: None,
                 args: vec![ArgSpec {
                     words: vec![
                         "alpha".into(),
@@ -716,6 +852,32 @@ mod tests {
         let mut ctx = parse::parse(input).unwrap();
         with_system(&mut ctx, channel, 3, &parse::MessageMeta::default());
         static_table().resolve(&ctx, CONFIRM_TTL, help)
+    }
+
+    /// The one pattern-gated verb, with the pattern a deployment writes and the
+    /// same [`Pattern::new`] path a config goes through — so these tests gate on
+    /// the real thing rather than on a stub.
+    fn gated_table() -> &'static VerbTable {
+        static TABLE: std::sync::OnceLock<VerbTable> = std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            VerbTable::new(vec![VerbSpec {
+                name: "ping".into(),
+                desc: "hops, delay and repeaters of your message".into(),
+                channel: Some("#bot".into()),
+                get: Some(ActionSpec {
+                    script: None,
+                    reply: "ping: {{delay}}s, {{hops}} hops | {{repeaters}}".into(),
+                    ..ActionSpec::default()
+                }),
+                arg_pattern: Some(Pattern::new("[*]|eu|fr|fr-44|nantes|nte|landreau").unwrap()),
+                args: vec![],
+            }])
+        })
+    }
+
+    fn resolve_gated(input: &str) -> Resolution<'static> {
+        let ctx = parse::parse(input).unwrap();
+        gated_table().resolve(&ctx, CONFIRM_TTL, HelpMode::Full)
     }
 
     #[test]
@@ -911,6 +1073,111 @@ mod tests {
     fn a_bad_arg_points_at_help_for_the_verb() {
         let reply = resolve("garage opne").into_reply(HelpMode::Full).unwrap();
         assert_eq!(reply, "garage: 'opne'? try 'help garage'");
+    }
+
+    // ---- `arg_pattern`: a verb that takes an argument, and answers only when
+    // ---- the pattern accepts it.
+
+    /// The gate itself: an argument containing one of the alternatives fires
+    /// the reply-only action, and the gate neither invents a script nor turns
+    /// the argument into a declared word.
+    #[test]
+    fn a_gated_verb_answers_only_on_a_matching_argument() {
+        for input in [
+            "ping nantes",
+            // The parser folds the argument, and the pattern is compiled
+            // case-blind, so neither spelling of either side can miss.
+            "ping Nantes-44",
+            "ping FR-44TRIG-c14",
+            "ping 44NTE-Tico",
+            "ping landreau",
+            "ping *",
+            // Contains, not equals: the alternatives are searched for.
+            "ping xxfr-44yy",
+        ] {
+            match resolve_gated(input) {
+                Resolution::Fire { verb, action, word } => {
+                    assert_eq!(verb.name, "ping", "{input}");
+                    assert!(action.script.is_none(), "{input}");
+                    assert_eq!(word, None, "{input}");
+                }
+                other => panic!("{input}: expected Fire, got {other:?}"),
+            }
+        }
+    }
+
+    /// A word the pattern refuses earns no reply at all. That is the whole
+    /// point of the gate — a shared channel where a wrong word is answered is
+    /// a channel where the bot talks over it — and both help surfaces are
+    /// checked because they are built separately.
+    #[test]
+    fn a_gated_verb_is_silent_on_a_word_the_pattern_refuses() {
+        for word in ["bonjour", "hello", "1234"] {
+            let input = format!("ping {word}");
+            let res = resolve_gated(&input);
+            match &res {
+                Resolution::ArgNoMatch { input: refused, .. } => assert_eq!(refused, word),
+                other => panic!("{input}: expected ArgNoMatch, got {other:?}"),
+            }
+            assert_eq!(
+                resolve_gated(&input).into_reply(HelpMode::Full),
+                None,
+                "{input} was answered"
+            );
+            assert_eq!(
+                resolve_gated(&input).into_reply(HelpMode::ListOnly),
+                None,
+                "{input} was answered"
+            );
+        }
+    }
+
+    /// The argument is required, not optional: a bare `ping` used to fire the
+    /// status reply, and it is a missing argument now.
+    #[test]
+    fn a_gated_verb_without_an_argument_is_silent() {
+        let res = resolve_gated("ping");
+        assert!(matches!(&res, Resolution::NeedsArg { .. }), "{res:?}");
+        assert_eq!(res.into_reply(HelpMode::Full), None);
+        assert_eq!(resolve_gated("ping  ").into_reply(HelpMode::ListOnly), None);
+    }
+
+    /// Case-insensitivity is a property of how the pattern is *compiled*, so it
+    /// holds however the operator spells it in the config.
+    #[test]
+    fn the_pattern_is_case_insensitive_however_it_is_written() {
+        let table = VerbTable::new(vec![VerbSpec {
+            name: "greet".into(),
+            desc: "test".into(),
+            channel: Some("#bot".into()),
+            get: Some(ActionSpec {
+                script: None,
+                reply: "hello".into(),
+                ..ActionSpec::default()
+            }),
+            arg_pattern: Some(Pattern::new("NANTES").unwrap()),
+            args: vec![],
+        }]);
+        for input in ["greet NANTES", "greet nantes", "greet NaNtEs"] {
+            let ctx = parse::parse(input).unwrap();
+            let res = table.resolve(&ctx, CONFIRM_TTL, HelpMode::Full);
+            assert!(
+                matches!(&res, Resolution::Fire { .. }),
+                "{input}: got {res:?}"
+            );
+        }
+    }
+
+    /// A pattern that does not compile is a config error at load, never a
+    /// failure at message time — where a refused argument is silent and the
+    /// error would be invisible.
+    #[test]
+    fn a_pattern_that_does_not_compile_is_refused_at_construction() {
+        assert!(Pattern::new("(").is_err());
+        assert!(
+            Pattern::new("").is_ok(),
+            "empty compiles; the loader refuses it"
+        );
     }
 
     /// With no channel in the context — the startup view — every verb is
@@ -1407,7 +1674,9 @@ mod tests {
         let table = &loaded.table;
         for name in table.names() {
             // A bare verb is actionable only where the config declares a status
-            // query; `reboot` has none, and `help` is handled before the table.
+            // query; `reboot` has none, `help` is handled before the table, and
+            // a pattern-gated verb takes an argument, so on its own it is a
+            // missing one rather than something to run.
             let verb = table.get(name).unwrap();
             let resolution = table.resolve(
                 &parse::parse(name).unwrap(),
@@ -1416,7 +1685,7 @@ mod tests {
             );
             assert_eq!(
                 resolution.is_actionable(),
-                verb.get.is_some(),
+                verb.get.is_some() && verb.arg_pattern.is_none(),
                 "{name} actionability disagrees with its declared query"
             );
 
