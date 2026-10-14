@@ -23,7 +23,11 @@ use crate::verbs::{ActionSpec, VerbSpec, VerbTable};
 
 /// The only schema this build speaks. A config written for a different one is
 /// refused rather than partially applied.
-pub const SCHEMA: u64 = 1;
+///
+/// Schema 2 moved the help-surface narrowing from `bot.help_list_only` onto the
+/// channel entry it describes (`quiet: true`), which is why a schema 1 config is
+/// refused rather than read leniently.
+pub const SCHEMA: u64 = 2;
 
 /// Host location, overridable so the example config runs without a deploy.
 pub const DEFAULT_CONFIG_PATH: &str = "/data/meshcore/meshbot-rs/config.yaml";
@@ -55,7 +59,7 @@ struct Bot {
     /// Physical radio channel index -> the name the radio reports for it.
     /// Matching is by index *and* name, so a stale index fails loudly at
     /// startup instead of listening to a channel that was renumbered.
-    channels: BTreeMap<u8, String>,
+    channels: BTreeMap<u8, ChannelSpec>,
     /// Where action scripts live. `MESHBOT_SCRIPT_DIR` overrides this, so the
     /// examples in this repo run without a deploy.
     script_dir: PathBuf,
@@ -63,11 +67,106 @@ struct Bot {
     /// Omitted means [`crate::latch::CONFIRM_TTL_SECS`].
     #[serde(default)]
     confirm_ttl_secs: Option<u64>,
-    /// Channel indices where only the bare `help` command answers: a named
-    /// topic (`help reboot`) is silent and no reply mentions help. Omitted
-    /// means every channel gets the full help surface.
-    #[serde(default)]
-    help_list_only: Vec<u8>,
+}
+
+/// One entry of `bot.channels`: the name the radio holds, and how much the bot
+/// is willing to say there.
+///
+/// Two spellings, so a channel with nothing to configure stays one line:
+///
+/// ```yaml
+/// channels:
+///   2: "ruellan-family #biniou-monitori"   # shorthand, quiet defaults to false
+///   0:
+///     name: "#bot"
+///     quiet: true
+/// ```
+///
+/// The shorthand is the common case — most channels are ordinary — and the map
+/// form is only reached for the ones that set something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSpec {
+    /// The channel name exactly as the radio reports it, truncation included.
+    pub name: String,
+    /// Narrow the help surface: the bare `help` answers, a named topic does not,
+    /// no reply points at help, and a message missing the `!` marker is chat
+    /// rather than a nudge. Commands still answer — see [`crate::verbs::HelpMode`].
+    pub quiet: bool,
+}
+
+impl<'de> Deserialize<'de> for ChannelSpec {
+    /// Accept either spelling of a channel entry.
+    ///
+    /// A visitor rather than `#[serde(untagged)]`: untagged reports
+    /// "data did not match any variant" for a mistyped key, which names neither
+    /// the channel nor the key the operator got wrong. Hand-written, the map arm
+    /// can name the key — a real message reads
+    /// `bot.channels.3: unknown key "quite", expected 'name' or 'quiet' at
+    /// line 4 column 8`, with the path and location supplied by the deserializer.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChannelSpecVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ChannelSpecVisitor {
+            type Value = ChannelSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a channel name, or a mapping of `name` and optional `quiet`")
+            }
+
+            /// `0: "#bot"` — the name alone, full help surface.
+            fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ChannelSpec {
+                    name: name.to_string(),
+                    quiet: false,
+                })
+            }
+
+            /// `0: {name: "#bot", quiet: true}` — the name plus options.
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut name: Option<String> = None;
+                let mut quiet: Option<bool> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => {
+                            if name.is_some() {
+                                return Err(serde::de::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value()?);
+                        }
+                        "quiet" => {
+                            if quiet.is_some() {
+                                return Err(serde::de::Error::duplicate_field("quiet"));
+                            }
+                            quiet = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown key {other:?}, expected 'name' or 'quiet'"
+                            )));
+                        }
+                    }
+                }
+
+                let name = name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
+                Ok(ChannelSpec {
+                    name,
+                    quiet: quiet.unwrap_or(false),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ChannelSpecVisitor)
+    }
 }
 
 /// A validated config, ready to hand to the rest of the bot.
@@ -86,19 +185,22 @@ pub struct Loaded {
     /// The confirmation window the latch is built with, in seconds. Resolved
     /// from `bot.confirm_ttl_secs`, or the default when the key is absent.
     pub confirm_ttl_secs: u64,
-    /// Channels where only the bare `help` answers, resolved from
-    /// `bot.help_list_only` and checked against the listen set.
-    pub help_list_only: BTreeSet<u8>,
+    /// Channels declared `quiet: true`, derived from `bot.channels` itself.
+    ///
+    /// Derived rather than declared, so there is no second list to drift out of
+    /// agreement with the listen set: an index can only be here if it is also in
+    /// `channels`, which `validate_channels` has already range-checked.
+    pub quiet: BTreeSet<u8>,
 }
 
 impl Loaded {
     /// The help mode of the channel a message arrived on.
     ///
     /// The one place the index set becomes a policy, so `decide` and the tests
-    /// cannot disagree about which channels are list-only.
+    /// cannot disagree about which channels are quiet.
     pub fn help_mode(&self, channel_idx: u8) -> crate::verbs::HelpMode {
-        if self.help_list_only.contains(&channel_idx) {
-            crate::verbs::HelpMode::ListOnly
+        if self.quiet.contains(&channel_idx) {
+            crate::verbs::HelpMode::Quiet
         } else {
             crate::verbs::HelpMode::Full
         }
@@ -141,7 +243,15 @@ fn build(cfg: Config, dir: PathBuf) -> Result<Loaded> {
     let channels = validate_channels(&cfg.bot.channels)?;
     let reserved = validate_verbs(&cfg.verbs, &channels, &dir)?;
     let confirm_ttl_secs = validate_confirm_ttl(cfg.bot.confirm_ttl_secs)?;
-    let help_list_only = validate_help_list_only(&cfg.bot.help_list_only, &channels)?;
+    // Derived from the same map `channels` came from, so the two cannot disagree:
+    // every index here was range-checked by `validate_channels` a line above.
+    let quiet = cfg
+        .bot
+        .channels
+        .iter()
+        .filter(|(_, spec)| spec.quiet)
+        .map(|(idx, _)| *idx)
+        .collect();
 
     Ok(Loaded {
         channels,
@@ -149,7 +259,7 @@ fn build(cfg: Config, dir: PathBuf) -> Result<Loaded> {
         reserved,
         script_dir: dir,
         confirm_ttl_secs,
-        help_list_only,
+        quiet,
     })
 }
 
@@ -171,31 +281,6 @@ fn validate_confirm_ttl(ttl: Option<u64>) -> Result<u64> {
         ),
         Some(ttl) => Ok(ttl),
     }
-}
-
-/// The channels that get only the bare `help`, checked against the listen set.
-///
-/// An index the bot does not listen on can never receive a message, so listing
-/// one is either a typo for an index that does exist or a leftover from a
-/// channel that was removed — both worth a startup error rather than a setting
-/// that silently does nothing.
-fn validate_help_list_only(list: &[u8], channels: &[(u8, String)]) -> Result<BTreeSet<u8>> {
-    let listened: BTreeSet<u8> = channels.iter().map(|(i, _)| *i).collect();
-    let mut resolved = BTreeSet::new();
-    for idx in list {
-        ensure!(
-            listened.contains(idx),
-            "bot.help_list_only has index {idx}, which is not in bot.channels; \
-             listening on {}",
-            listened
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        resolved.insert(*idx);
-    }
-    Ok(resolved)
 }
 
 fn effective_script_dir(bot: &Bot) -> PathBuf {
@@ -238,14 +323,18 @@ pub fn example() -> &'static Loaded {
 }
 
 /// The listen set, checked for the things that make a channel unusable.
-fn validate_channels(channels: &BTreeMap<u8, String>) -> Result<Vec<(u8, String)>> {
+///
+/// The `quiet` flag rides along unchecked here by design: it is a property of an
+/// entry that passed every check below, so unlike the deleted `bot.help_list_only`
+/// it cannot name an index this function would reject.
+fn validate_channels(channels: &BTreeMap<u8, ChannelSpec>) -> Result<Vec<(u8, String)>> {
     ensure!(
         !channels.is_empty(),
         "bot.channels is empty: nothing to listen on"
     );
 
     let mut names: BTreeSet<&str> = BTreeSet::new();
-    for (idx, name) in channels {
+    for (idx, spec) in channels {
         // A channel the startup readback never reaches is a channel nobody
         // verifies, and the bot will not create it: an out-of-range index is a
         // config mistake to fix here, not a slot to invent at the radio.
@@ -255,7 +344,7 @@ fn validate_channels(channels: &BTreeMap<u8, String>) -> Result<Vec<(u8, String)
              exposes; nothing would ever verify it"
         );
 
-        let name = name.trim();
+        let name = spec.name.trim();
         ensure!(
             !name.is_empty(),
             "bot.channels has an empty name for index {idx}"
@@ -283,7 +372,7 @@ fn validate_channels(channels: &BTreeMap<u8, String>) -> Result<Vec<(u8, String)
     }
     Ok(channels
         .iter()
-        .map(|(i, n)| (*i, n.trim().to_string()))
+        .map(|(i, spec)| (*i, spec.name.trim().to_string()))
         .collect())
 }
 
@@ -520,7 +609,7 @@ mod tests {
     fn config(verbs: &str) -> Result<Loaded> {
         from_yaml(
             &format!(
-                "schema: 1\nbot:\n  channels: {{2: admin, 3: home}}\n  script_dir: /unused\nverbs:\n{verbs}"
+                "schema: 2\nbot:\n  channels: {{2: admin, 3: home}}\n  script_dir: /unused\nverbs:\n{verbs}"
             ),
             &scripts(),
         )
@@ -531,7 +620,7 @@ mod tests {
     fn config_at(idx: u8, verbs: &str) -> Result<Loaded> {
         from_yaml(
             &format!(
-                "schema: 1\nbot:\n  channels: {{{idx}: admin}}\n  script_dir: /unused\nverbs:\n{verbs}"
+                "schema: 2\nbot:\n  channels: {{{idx}: admin}}\n  script_dir: /unused\nverbs:\n{verbs}"
             ),
             &scripts(),
         )
@@ -710,7 +799,7 @@ mod tests {
 
     #[test]
     fn one_channel_name_cannot_be_two_indices() {
-        let raw = "schema: 1\nbot:\n  channels: {2: admin, 3: admin}\n  script_dir: /unused\nverbs:\n  - name: garage\n    channel: admin\n    get:\n      script: ok.sh\n      reply: a\n";
+        let raw = "schema: 2\nbot:\n  channels: {2: admin, 3: admin}\n  script_dir: /unused\nverbs:\n  - name: garage\n    channel: admin\n    get:\n      script: ok.sh\n      reply: a\n";
         let err = from_yaml(raw, &scripts()).unwrap_err().to_string();
         assert!(err.contains("twice"), "{err}");
     }
@@ -760,7 +849,7 @@ mod tests {
     #[test]
     fn a_configured_confirm_ttl_is_used() {
         let loaded = from_yaml(
-            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  confirm_ttl_secs: 600\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            "schema: 2\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  confirm_ttl_secs: 600\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
             &scripts(),
         )
         .unwrap();
@@ -772,7 +861,7 @@ mod tests {
     #[test]
     fn a_zero_confirm_ttl_is_fatal() {
         let err = from_yaml(
-            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  confirm_ttl_secs: 0\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            "schema: 2\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  confirm_ttl_secs: 0\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
             &scripts(),
         )
         .unwrap_err()
@@ -781,43 +870,89 @@ mod tests {
         assert!(err.contains("permanently unrunnable"), "{err}");
     }
 
-    /// The key is optional, and a config written before it existed must still
-    /// start with every channel on the full help surface.
+    /// `quiet` is optional and defaults off, so a config that never mentions it
+    /// starts with every channel on the full help surface — and the shorthand
+    /// spelling, which cannot set it at all, is how the common case reads.
     #[test]
-    fn an_absent_help_list_only_means_full_help_everywhere() {
+    fn an_absent_quiet_means_full_help_everywhere() {
         let loaded = config("  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n").unwrap();
-        assert!(loaded.help_list_only.is_empty());
+        assert!(loaded.quiet.is_empty());
         assert_eq!(loaded.help_mode(2), HelpMode::Full);
         assert_eq!(loaded.help_mode(3), HelpMode::Full);
     }
 
-    /// A listed channel resolves to the list-only mode; one that is not listed
-    /// keeps full help.
+    /// A channel declared `quiet: true` resolves to the quiet mode; its
+    /// neighbour, which did not, keeps full help.
     #[test]
-    fn a_listed_channel_is_list_only_and_the_others_are_not() {
+    fn a_quiet_channel_is_quiet_and_the_others_are_not() {
         let loaded = from_yaml(
-            "schema: 1\nbot:\n  channels: {2: admin, 3: home}\n  script_dir: /unused\n  help_list_only: [3]\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            "schema: 2\nbot:\n  channels:\n    2: admin\n    3: {name: home, quiet: true}\n  script_dir: /unused\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
             &scripts(),
         )
         .unwrap();
-        assert_eq!(loaded.help_list_only, BTreeSet::from([3]));
-        assert_eq!(loaded.help_mode(3), HelpMode::ListOnly);
+        assert_eq!(loaded.quiet, BTreeSet::from([3]));
+        assert_eq!(loaded.help_mode(3), HelpMode::Quiet);
         assert_eq!(loaded.help_mode(2), HelpMode::Full);
     }
 
-    /// An index the bot does not listen on can never receive a message, so
-    /// listing one is a typo or a leftover — a startup error, not a setting
-    /// that silently does nothing.
+    /// A key that is not `name` or `quiet` is a typo for one of those two, so
+    /// the load names the key rather than matching the entry against a variant
+    /// and reporting that nothing fit. This is the specificity
+    /// `deny_unknown_fields` gives everywhere else in this file.
     #[test]
-    fn help_list_only_must_name_a_listened_channel() {
+    fn an_unknown_key_in_a_channel_entry_is_named() {
         let err = from_yaml(
-            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  help_list_only: [3]\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            "schema: 2\nbot:\n  channels:\n    3: {name: home, quite: true}\n  script_dir: /unused\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap_err();
+        // `{:#}` walks anyhow's chain: the parse error is the *source* of
+        // "cannot parse config", and only the source names the key.
+        let err = format!("{err:#}");
+        assert!(err.contains("quite"), "{err}");
+        assert!(err.contains("quiet"), "{err}");
+    }
+
+    /// The map spelling is the only one that can set options, and it has no
+    /// default for the name: an entry with nothing to identify it is a config
+    /// error, not an anonymous channel.
+    #[test]
+    fn a_channel_entry_without_a_name_is_refused() {
+        let err = from_yaml(
+            "schema: 2\nbot:\n  channels:\n    3: {quiet: true}\n  script_dir: /unused\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("name"), "{err}");
+    }
+
+    /// The old key is gone and this build speaks schema 2, so neither spelling
+    /// of the old configuration starts. The message must name the key the
+    /// operator actually wrote.
+    #[test]
+    fn the_removed_help_list_only_key_is_refused() {
+        let err = from_yaml(
+            "schema: 2\nbot:\n  channels: {2: admin}\n  script_dir: /unused\n  help_list_only: [2]\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
+            &scripts(),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("help_list_only"), "{err}");
+    }
+
+    /// A schema 1 config — every config written before this change — is refused
+    /// outright rather than read with the wrong understanding of its channels.
+    #[test]
+    fn schema_1_is_refused() {
+        let err = from_yaml(
+            "schema: 1\nbot:\n  channels: {2: admin}\n  script_dir: /unused\nverbs:\n  - name: reboot\n    channel: admin\n    get:\n      script: ok.sh\n      reply: up\n",
             &scripts(),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("help_list_only"), "{err}");
-        assert!(err.contains('3'), "{err}");
+        assert!(err.contains("schema 1"), "{err}");
+        assert!(err.contains("schema 2"), "{err}");
     }
 
     /// The shipped example is the schema's documentation, so it is validated by

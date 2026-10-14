@@ -641,7 +641,7 @@ Recorded so implementation doesn't relitigate them.
   bot that corrects every greeting talks over the channel. The two cases that
   already had a fallback keep it on a full-help channel: a bad word
   (`garage opne` → `try 'help garage'`) and a bad topic
-  (`help rebooot` → `try 'help'`). On a `bot.help_list_only` channel the bad
+  (`help rebooot` → `try 'help'`). On a `quiet: true` channel the bad
   word still answers (`garage: 'opne'?`) but never mentions help, and the bad
   topic is silent with everything else topic-shaped. The OSA/`edit_distance`
   machinery went away with the suggestions. The dropped word is logged at
@@ -714,9 +714,14 @@ Recorded so implementation doesn't relitigate them.
   advertises only what is possible *here*. A named topic (`help reboot`) is
   described on any full-help channel: help is how you learn what a command does
   before you are on the channel that runs it.
-- **`bot.help_list_only` silences everything but the bare `help`** on the
-  channels it names (indices, each validated against `bot.channels`). A named
-  topic is a `Resolution::Silent` — understood and refused, not unmatched, and
+- **`quiet: true` on a `bot.channels` entry silences everything but the bare
+  `help`** on that channel. The property sits on the entry it describes rather
+  than in a separate index list (it was `bot.help_list_only` before schema 2),
+  so the two cannot disagree: the quiet set is *derived* from the channel map in
+  `build()`, which `validate_channels` has already range-checked, and there is no
+  second list to drift. The shorthand spelling (`5: "#public"`) cannot set it, so
+  a channel that wants ordinary behaviour stays one line. A named topic is a
+  `Resolution::Silent` — understood and refused, not unmatched, and
   logged at debug by `decide` so the silence is distinguishable from a parse
   drop. The bare list drops its `try 'help <verb>'` pointer (advertising a
   surface that would answer nothing), and the `no command` / `try '<word>'` /
@@ -731,9 +736,13 @@ Recorded so implementation doesn't relitigate them.
   through `resolve`/`into_reply` as a
   `verbs::HelpMode`, resolved once per message from the channel index via
   `Loaded::help_mode`; `Full` is the default and byte-identical to the
-  previous behaviour. This exists for public or heavily-shared channels —
-  `#bot` in the biniou deployment — where `help reboot` would document the
-  only destructive verb for anyone who thought to ask.
+  previous behaviour. **`quiet` narrows the help surface only** — commands
+  scoped to the channel still answer, so the name is not a mute, and it is
+  deliberately distinct from `Resolution::Silent`, which is an outcome for one
+  message rather than a property of a channel. This exists for public or
+  heavily-shared channels — `#bot` in the biniou deployment — where
+  `help reboot` would document the only destructive verb for anyone who
+  thought to ask.
 - **`arg_pattern` is what makes a verb take an argument.** `ping nantes` fires
   when the pattern accepts `nantes`; a bare `ping` is a missing argument and a
   refused word (`ping bonjour`) is a drop. The pattern is compiled at config
@@ -770,8 +779,18 @@ Recorded so implementation doesn't relitigate them.
   own positional one — and nothing else, is compiled at load, and its verb may
   not expand `{{target}}` — so it gates whether a verb fires without ever
   putting message text on the air.
-- `schema: 1` at the top of `config.yaml`; refuse to start on mismatch so a
-  config edited ahead of a deploy fails loudly.
+- A channel entry is deserialized by a hand-written visitor rather than
+  `#[serde(untagged)]`, because untagged reports "data did not match any
+  variant" for a mistyped key and names neither the channel nor the key. The
+  visitor names the key, so a real message reads
+  `bot.channels.3: unknown key "quite", expected 'name' or 'quiet' at line 4
+  column 8` — the specificity `deny_unknown_fields` gives everywhere else,
+  kept for a structure untagged would have flattened into a generic failure.
+- `schema: 2` at the top of `config.yaml`; refuse to start on mismatch so a
+  config edited ahead of a deploy fails loudly. Schema 2 moved the help-surface
+  narrowing from `bot.help_list_only` onto the `quiet` flag of the channel entry
+  it describes, which is why a schema 1 config is refused rather than read
+  leniently.
 
 ## Do not
 - **Do not add `SET_CHANNEL`**, or any write to the radio's channel table or

@@ -11,7 +11,7 @@
 
 # Bumped on breaking changes. The binary refuses to start on a mismatch, so a
 # host config edited ahead of a deploy fails loudly instead of half-working.
-schema: 1
+schema: 2
 
 # The message language is `verb [word] [key=value ...]`:
 #
@@ -65,37 +65,50 @@ bot:
   # Never add a SET_CHANNEL call. That is the one command that engages the
   # proxy's channel virtualizer, which would remap these indices; a test in
   # src/main.rs fails the build if one appears.
+  #
+  # Each entry is either the channel name alone — the shorthand, and what most
+  # channels want — or a mapping of `name` plus options:
+  #
+  #   3: "#admin"                      # shorthand: name only, no options
+  #   5: {name: "#public", quiet: true}
+  #
+  # The name is the name the RADIO holds, truncation included (31 bytes, as
+  # above). Unknown keys inside a mapping are refused by name, so `quite:`
+  # reports `quite` rather than failing to match an entry.
   channels:
     3: "#admin"
     4: "#homeassistant"
     # A public hashtag: anyone on the mesh can post here, so it is also where
     # a full help would be noise and an oracle at once. No verb is scoped to
-    # it in this example — the channel map may list one none of them uses — and
-    # it is the channel `help_list_only`, below, points at.
-    5: "#public"
-
-  # Channels where only the bare `help` answers: a named topic (`help reboot`)
-  # is dropped, the bare list does not advertise `help <verb>`, no reply
-  # mentions help — a bad word still answers (`garage: 'opne'?`), it just
-  # never redirects — and a message that merely lacks the `!` marker is chat,
-  # never the `commands start with '!'` nudge. Indices, like the channels map,
-  # and each one must be a channel `bot.channels` listens on.
-  #
-  # Put a public or heavily-shared channel here. `help <verb>` on such a
-  # channel documents commands scoped to private ones — `help reboot` would
-  # spell out the only destructive action for anyone who thought to ask —
-  # and every `try 'help …'` hint advertises a surface that is then refused.
-  # Omitted means every channel gets the full help surface.
-  #
-  # What a wrong command earns on a listed channel: an unknown first word is
-  # dropped (true on every channel, list-only or not), `help <verb>` and a
-  # misspelled topic are dropped, and no reply mentions help. Two silences
-  # this key does NOT own, so they are not promised by it: a verb declared
-  # for another channel still answers `ping: not on this channel`, because
-  # channel scope is checked before this mode — and a wrong argument to an
-  # `arg_pattern` verb such as `ping` is dropped everywhere by that pattern,
-  # listed here or not (see `ping` below).
-  help_list_only: [5]
+    # it in this example — the channel map may list one none of them uses —
+    # so `quiet: true` below costs this example nothing.
+    #
+    # `quiet: true` is where only the bare `help` answers: a named topic
+    # (`help reboot`) is dropped, the bare list does not advertise
+    # `help <verb>`, no reply mentions help — a bad word still answers
+    # (`garage: 'opne'?`), it just never redirects — and a message that merely
+    # lacks the `!` marker is chat, never the `commands start with '!'` nudge.
+    # Omitted (or the shorthand spelling) means full help.
+    #
+    # Mark a public or heavily-shared channel. `help <verb>` on such a channel
+    # documents commands scoped to private ones — `help reboot` would spell
+    # out the only destructive action for anyone who thought to ask — and every
+    # `try 'help …'` hint advertises a surface that is then refused.
+    #
+    # What a wrong command earns on a quiet channel: an unknown first word is
+    # dropped (true on every channel, quiet or not), `help <verb>` and a
+    # misspelled topic are dropped, and no reply mentions help. Two silences
+    # this flag does NOT own, so they are not promised by it: a verb declared
+    # for another channel still answers `ping: not on this channel`, because
+    # channel scope is checked before this mode — and a wrong argument to an
+    # `arg_pattern` verb such as `ping` is dropped everywhere by that pattern,
+    # quiet or not (see `ping` below).
+    #
+    # `quiet` narrows the help surface only. Commands scoped to this channel
+    # still answer normally — it is not a mute.
+    5:
+      name: "#public"
+      quiet: true
 
   # How long a gated command stays armed waiting for its `… ok`, in seconds.
   # `reboot alpha` arms a proposal; this is the window in which `reboot alpha
@@ -128,10 +141,10 @@ bot:
 
 # `help` and `help <verb>` are built in: the reply is rendered from this table,
 # so a verb cannot be added without documenting it. How much of that surface a
-# channel exposes is `bot.help_list_only`, above.
+# channel exposes is its `quiet` flag, above.
 # The bare `help` lists only the verbs scoped to the channel it is asked on;
 # `help <verb>` describes any verb, wherever it is asked, except on a
-# list-only channel where it is dropped.
+# quiet channel where it is dropped.
 verbs:
   - name: alarm
     desc: "alarm state"
@@ -223,8 +236,7 @@ verbs:
     # `arg_pattern` is what makes the verb take an argument. The bare `ping` is
     # a missing argument and `ping bonjour` is a word the pattern refuses; both
     # are dropped in silence (logged at debug, nothing transmitted) on every
-    # channel — including one listed in `bot.help_list_only` — and only `ping
-    # nantes` fires.
+    # channel — including a `quiet` one — and only `ping nantes` fires.
     #
     # The pattern is an unanchored search, so it is a *contains* test, and it is
     # compiled case-insensitively every time — no `(?i)` to remember. Two

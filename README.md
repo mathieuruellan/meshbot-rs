@@ -39,21 +39,25 @@ does not compile stops the bot at startup rather than failing per message.
 
 ## Staying quiet on a channel
 
-`bot.help_list_only` names channels where only the bare `help` answers —
-indices, each of which must be one `bot.channels` listens on:
+A channel entry in `bot.channels` is either the name alone or the name plus
+options. `quiet: true` is where only the bare `help` answers:
 
 ```yaml
 bot:
-  help_list_only: [5]   # #public in config.example.yaml
+  channels:
+    5:
+      name: "#public"    # #public in config.example.yaml
+      quiet: true
+    4: "#homeassistant"  # shorthand: no options, full help
 ```
 
-On a listed channel `help <verb>` and a misspelled topic are dropped, no reply
+On a quiet channel `help <verb>` and a misspelled topic are dropped, no reply
 ever points at `help`, and a sentence that merely lacks the `!` marker is
 treated as chat instead of earning the `commands start with '!'` nudge. An
-unknown first word is dropped too, on every channel, list-only or not. The key
-narrows the help surface rather than muting the channel: a verb belonging to
-another one still answers `not on this channel`, since channel scope is checked
-first.
+unknown first word is dropped too, on every channel, quiet or not. The flag
+narrows the help surface rather than muting the channel: commands scoped to it
+still answer normally, and a verb belonging to another channel still answers
+`not on this channel`, since channel scope is checked first.
 
 A wrong argument to `ping` is a separate, channel-independent silence, owned by
 `arg_pattern`: wherever `ping` is declared, `!ping` and `!ping bonjour`
