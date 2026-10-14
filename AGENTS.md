@@ -33,7 +33,7 @@ because it is described below — check `src/`.
 cargo check
 cargo clippy --all-targets
 cargo fmt
-cargo test          # 198 unit tests, no radio needed
+cargo test          # 225 unit tests, no radio needed
 cargo run          # needs MESHCORE_HOST/PORT reachable
 ```
 There is still no test suite for the radio itself: the unit tests cover the
@@ -561,7 +561,9 @@ Recorded so implementation doesn't relitigate them.
   enum removes.
 - **Context** is a **flat key/value map**, not a struct: `verb`, the declared
   enum word as `target`, message slots, `channel`, `channel_idx`, `snr`,
-  `sender_timestamp`, `.env` keys, and `status`.
+  `sender_timestamp`, `.env` keys, and `status`. The one exception to "declared
+  enum word" is an `arg_pattern` verb, where `target` carries the free argument
+  instead — which is why such a verb may not expand `{{target}}`.
 - **Reserved keys**: `verb`, `confirm`, `channel`, `channel_idx`, `snr`,
   `sender_timestamp`, `status`, `stdout`, `target`, and every `.env` key. A
   message carrying a reserved key must not overwrite the real value — that rule
@@ -725,6 +727,28 @@ Recorded so implementation doesn't relitigate them.
   previous behaviour. This exists for public or heavily-shared channels —
   `#bot` in the biniou deployment — where `help reboot` would document the
   only destructive verb for anyone who thought to ask.
+- **`arg_pattern` is what makes a verb take an argument.** `ping nantes` fires
+  when the pattern accepts `nantes`; a bare `ping` is a missing argument and a
+  refused word (`ping bonjour`) is a drop. The pattern is compiled at config
+  load and is case-insensitive *by construction*, so it cannot be edited into
+  one that only matches by accident of case, and it is an unanchored search —
+  `is_match` is a contains test, which is what writing `nantes` rather than
+  `^nantes$` means. An invalid pattern is a startup error, so a gate that never
+  compiled cannot present as a bot that simply never answers.
+  Both refusals arrive as new [`Resolution`] variants — `NeedsArg` and
+  `ArgNoMatch` — which render **no reply**: the gate exists to keep a shared
+  channel quiet, and answering "that word does not match" would put the bot
+  back over the conversation it was configured to stay out of. `decide` logs
+  each at `debug`, separately, so a silence on air still has a cause in the
+  log rather than looking like a parse drop.
+  It is not a second way to select an action: `Fire` still carries
+  `word: None`, because the argument is not a declared word, and the loader
+  refuses `{{target}}` on such a verb along with any `args:` words. That
+  refusal is load-bearing — the parser puts the argument in the context as
+  `target` (that is how the verb saw it), so `{{target}}` is the one
+  placeholder that would carry free message text into a reply or a script argv.
+  Needs the image at **0.11.0**; an older one rejects the key as unknown and
+  refuses to start, so image pin and config key move together.
 - **`decide()` is pure and takes no `MeshCore`.** All policy — parse, scope,
   resolution, latch — lives there, and `handle_message` is only the I/O around
   it. That is what makes the latch and the scope check testable on a machine
@@ -734,7 +758,11 @@ Recorded so implementation doesn't relitigate them.
   so dropping the future on timeout drops the child — and tokio's default is
   `kill_on_drop(false)`, which would leave a script running past its timeout.
 - **Rules**: declarative `when` constraints only. No expression DSL, no `eval`,
-  no regex over raw message text. Unknown config keys fail at load.
+  no regex over raw message text. Unknown config keys fail at load. The schema's
+  one regex is `arg_pattern` (below): it sees exactly one argument — the verb's
+  own positional one — and nothing else, is compiled at load, and its verb may
+  not expand `{{target}}` — so it gates whether a verb fires without ever
+  putting message text on the air.
 - `schema: 1` at the top of `config.yaml`; refuse to start on mismatch so a
   config edited ahead of a deploy fails loudly.
 
