@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.11.0...v0.12.0) (2026-10-14)
+
+
+### Features
+
+* move the help-surface narrowing onto the channel as quiet ([a3a1299](https://github.com/mathieuruellan/meshbot-rs/commit/a3a129976039d7bd3932035357693ae1008fff2a))
+
 ## [0.11.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.10.1...v0.11.0) (2026-10-14)
 
 
