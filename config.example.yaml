@@ -206,7 +206,9 @@ verbs:
       reply: "{{stdout}}"
 
   - name: ping
-    desc: "hops, delay and repeaters of your message"
+    # The argument is part of the usage, and this line is the only place that
+    # can say so on the air: `help ping` renders it.
+    desc: "hops, delay and repeaters of your message; needs an argument"
     channel: "#admin"
     # `arg_pattern` is what makes the verb take an argument. The bare `ping` is
     # a missing argument and `ping bonjour` is a word the pattern refuses; both
