@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/mathieuruellan/meshbot-rs/compare/v0.10.1...v0.11.0) (2026-10-14)
+
+
+### Features
+
+* gate a verb's argument on a configured regex ([#35](https://github.com/mathieuruellan/meshbot-rs/issues/35)) ([107a8de](https://github.com/mathieuruellan/meshbot-rs/commit/107a8de7f065b065bc2bb60dc07aa29a1b7148dc))
+
 ## [0.10.1](https://github.com/mathieuruellan/meshbot-rs/compare/v0.10.0...v0.10.1) (2026-10-13)
 
 
