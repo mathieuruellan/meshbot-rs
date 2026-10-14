@@ -70,7 +70,8 @@ bot:
     4: "#homeassistant"
     # A public hashtag: anyone on the mesh can post here, so it is also where
     # a full help would be noise and an oracle at once. No verb is scoped to
-    # it in this example — the channel map may list one none of them uses.
+    # it in this example — the channel map may list one none of them uses — and
+    # it is the channel `help_list_only`, below, points at.
     5: "#public"
 
   # Channels where only the bare `help` answers: a named topic (`help reboot`)
@@ -85,6 +86,15 @@ bot:
   # spell out the only destructive action for anyone who thought to ask —
   # and every `try 'help …'` hint advertises a surface that is then refused.
   # Omitted means every channel gets the full help surface.
+  #
+  # What a wrong command earns on a listed channel: an unknown first word is
+  # dropped (true on every channel, list-only or not), `help <verb>` and a
+  # misspelled topic are dropped, and no reply mentions help. Two silences
+  # this key does NOT own, so they are not promised by it: a verb declared
+  # for another channel still answers `ping: not on this channel`, because
+  # channel scope is checked before this mode — and a wrong argument to an
+  # `arg_pattern` verb such as `ping` is dropped everywhere by that pattern,
+  # listed here or not (see `ping` below).
   help_list_only: [5]
 
   # How long a gated command stays armed waiting for its `… ok`, in seconds.
@@ -212,8 +222,9 @@ verbs:
     channel: "#admin"
     # `arg_pattern` is what makes the verb take an argument. The bare `ping` is
     # a missing argument and `ping bonjour` is a word the pattern refuses; both
-    # are dropped in silence (logged at debug, nothing transmitted), and only
-    # `ping nantes` fires.
+    # are dropped in silence (logged at debug, nothing transmitted) on every
+    # channel — including one listed in `bot.help_list_only` — and only `ping
+    # nantes` fires.
     #
     # The pattern is an unanchored search, so it is a *contains* test, and it is
     # compiled case-insensitively every time — no `(?i)` to remember. Two

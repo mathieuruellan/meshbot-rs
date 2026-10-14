@@ -37,6 +37,28 @@ somebody's word choice. The argument decides whether the verb fires and nothing
 else — it never reaches a reply template or a script argument. A pattern that
 does not compile stops the bot at startup rather than failing per message.
 
+## Staying quiet on a channel
+
+`bot.help_list_only` names channels where only the bare `help` answers —
+indices, each of which must be one `bot.channels` listens on:
+
+```yaml
+bot:
+  help_list_only: [5]   # #public in config.example.yaml
+```
+
+On a listed channel `help <verb>` and a misspelled topic are dropped, no reply
+ever points at `help`, and a sentence that merely lacks the `!` marker is
+treated as chat instead of earning the `commands start with '!'` nudge. An
+unknown first word is dropped too, on every channel, list-only or not. The key
+narrows the help surface rather than muting the channel: a verb belonging to
+another one still answers `not on this channel`, since channel scope is checked
+first.
+
+A wrong argument to `ping` is a separate, channel-independent silence, owned by
+`arg_pattern`: wherever `ping` is declared, `!ping` and `!ping bonjour`
+transmit nothing and only `!ping Nantes-44` answers.
+
 ## Run it
 
 ```sh
