@@ -6,5 +6,5 @@
 # pins a minor (`rust:1.99-slim-bookworm`) and this pins the exact patch. They
 # cannot read each other, so that pair is the one duplication in the repo.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
