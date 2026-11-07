@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", ":enableVulnerabilityAlerts"],
+  "platformAutomerge": true,
   "prHourlyLimit": 4,
   "prConcurrentLimit": 10,
   "packageRules": [
@@ -21,6 +22,28 @@
     {
       "matchPackageNames": ["pest", "pest_derive"],
       "groupName": "pest"
+    },
+    {
+      "description": "Major updates: manual review, never auto-merge",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "GitHub Actions: no shipped binary/image impact; auto-merge non-major without release bump",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
+      "automerge": true,
+      "platformAutomerge": true,
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps",
+      "commitMessageTopic": "{{depName}}"
+    },
+    {
+      "description": "Artifact-impacting deps (Cargo, Docker, toolchain/runtime inputs): auto-merge non-major; release-please proposes release",
+      "matchManagers": ["cargo", "dockerfile", "docker-compose", "regex", "custom.regex"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest", "lockFileMaintenance"],
+      "automerge": true,
+      "platformAutomerge": true
     }
   ]
 }
